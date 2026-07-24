@@ -1,0 +1,22 @@
+# Secrets — never commit these. Real values live only on this machine /
+# cPanel's own .env, and as GitHub Actions Secrets for the workflow.
+.env
+.env.*
+!.env.example
+
+# Dependencies — reinstalled via package.json, no need to version them
+node_modules/
+
+# Anything zipped up for manual cPanel uploads (not needed once Git is set up)
+*.zip
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Leftover backup folder from manual cPanel upload workflow — not part of the app
+New folder/
+
+# Old local screenshot files from before the FTP/cPanel storage switch —
+# screenshots now live on cPanel, not on disk here.
+storage/

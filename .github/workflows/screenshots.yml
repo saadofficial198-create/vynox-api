@@ -1,0 +1,54 @@
+name: Capture site screenshots
+
+# Runs on GitHub's free Ubuntu runners (unlimited free minutes on public
+# repos) instead of the cPanel backend, because shared cPanel Node.js
+# hosting cannot run Playwright/Chromium. See scripts/runScreenshots.js and
+# services/screenshot.js for the full explanation.
+#
+# Times are in UTC. Adjust to match when you want captures in your local
+# time zone (Pakistan is UTC+5, so e.g. "0 4,10,16 * * *" = 09:00, 15:00,
+# 21:00 PKT). Currently set to 2x/day per the cost-conscious plan discussed;
+# add a third cron line to go back to 3x/day.
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 09:00 PKT
+    - cron: '0 10 * * *'  # 15:00 PKT
+  workflow_dispatch: {}    # lets you trigger a run manually from the Actions tab
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90 # generous ceiling — actual runs should finish well under this even at 150 sites
+    defaults:
+      run:
+        working-directory: vynox-api
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: vynox-api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright's Chromium + OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run screenshot capture
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_BASE: ${{ secrets.FTP_REMOTE_BASE }}
+          FTP_SECURE: ${{ secrets.FTP_SECURE }}
+          SCREENSHOT_PUBLIC_BASE_URL: ${{ secrets.SCREENSHOT_PUBLIC_BASE_URL }}
+          SCREENSHOT_DIFF_THRESHOLD_PCT: ${{ secrets.SCREENSHOT_DIFF_THRESHOLD_PCT }}
+          SCREENSHOT_JPEG_QUALITY: ${{ secrets.SCREENSHOT_JPEG_QUALITY }}
+        run: node scripts/runScreenshots.js

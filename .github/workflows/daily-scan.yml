@@ -1,0 +1,40 @@
+name: Daily security scan
+
+# Triggers the backend's daily site sync (pull /wp-json/vynox/v1/data for
+# every site, store a Snapshot, update Site.latest health status, sync the
+# persisted Alert collection, and send email notifications for newly-offline
+# sites / new high-severity alerts — see services/scanAllSites.js).
+#
+# This replaces the old manual per-site "Sync" button on the frontend. Since
+# the vynox-api backend runs on shared cPanel hosting (no cron/SSH access for
+# scheduled jobs), we trigger it the same way screenshots.yml already
+# triggers screenshot captures: a scheduled GitHub Actions run hitting a
+# protected HTTP endpoint. This job is much simpler though — no Node/
+# Playwright setup, just a single curl call.
+#
+# Time is in UTC. 03:00 UTC = 08:00 PKT (Pakistan is UTC+5) — picked as an
+# off-peak time, well clear of the screenshot capture windows (04:00/10:00
+# UTC) in screenshots.yml.
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 08:00 PKT
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # this just makes one HTTP call and waits for the backend to finish its loop
+    steps:
+      - name: Trigger daily scan
+        run: |
+          status=$(curl -s -o /tmp/response.txt -w "%{http_code}" -X POST \
+            "https://vynox.progamesgears.com/api/scan/run-all" \
+            -H "X-Scan-Secret: ${{ secrets.SCAN_TRIGGER_SECRET }}")
+          echo "Response body:"
+          cat /tmp/response.txt
+          echo ""
+          echo "HTTP status: $status"
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Scan trigger failed with status $status"
+            exit 1
+          fi

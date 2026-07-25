@@ -3,63 +3,12 @@ import axios from 'axios';
 import Site from '../models/Site.js';
 import Snapshot from '../models/Snapshot.js';
 import { detectMonitoredPages } from '../services/sitemapDetect.js';
+import { deriveHealthStatus } from '../services/healthStatus.js';
 
 const router = express.Router();
 
-// In-memory sync job tracker (survives as long as the Node process is alive)
-// Map<siteId, { status: 'running'|'done'|'error', startedAt, finishedAt, error }>
-const syncJobs = new Map();
-
 function cleanUrl(url) {
   return String(url || '').trim().replace(/\/$/, '');
-}
-
-function startsYes(v) { return typeof v === 'string' && /^yes/i.test(v); }
-
-function computeSummary(data) {
-  if (!data) return null;
-  const sec     = data.security || {};
-  const health  = data.health?.summary || { good: 0, recommended: 0, critical: 0 };
-  const updates = data.updates  || {};
-  const malware = data.malware  || {};
-
-  let score = 100;
-  score -= (health.critical    || 0) * 15;
-  score -= (health.recommended || 0) * 5;
-  score -= updates.core_update_available === 'yes' ? 10 : 0;
-  score -= (updates.plugins_to_update || 0) * 2;
-  score -= (updates.themes_to_update  || 0) * 2;
-  score -= (malware.suspicious_count  || 0) * 25;
-  score -= /^no/i.test(sec.ssl_enabled || '') ? 20 : 0;
-  score -= startsYes(sec.file_editor_enabled) ? 5 : 0;
-  score -= startsYes(sec.admin_path_default)  ? 3 : 0;
-  score = Math.max(0, Math.min(100, score));
-
-  const alerts =
-    (health.critical    || 0) +
-    (health.recommended || 0) +
-    (startsYes(sec.file_editor_enabled) ? 1 : 0) +
-    (startsYes(sec.admin_path_default)  ? 1 : 0) +
-    (malware.suspicious_count || 0);
-
-  const updateCount =
-    (updates.core_update_available === 'yes' ? 1 : 0) +
-    (updates.plugins_to_update || 0) +
-    (updates.themes_to_update  || 0);
-
-  return {
-    score,
-    alerts,
-    updates: updateCount,
-    phpVersion: data.site?.php_version || null,
-    wpVersion:  data.site?.wp_version  || null,
-    dbSize:     data.database?.db_size || null,
-    diskUsedPct: data.disk?.disk_used_percent || null,
-    lastBackup: data.backups?.last_backup?.modified || null,
-    backupCount: data.backups?.backup_count ?? 0,
-    pluginsActive: data.plugins?.active ?? 0,
-    snapshotAt: new Date(),
-  };
 }
 
 async function callConnector(url, apiKey, path, timeoutMs = 10000) {
@@ -145,7 +94,7 @@ router.post('/register', async (req, res) => {
           await Snapshot.create({ site: site._id, ok: true, data: r.data });
           site.status = 'online';
           site.lastSyncedAt = new Date();
-          site.latest = computeSummary(r.data);
+          site.latest = deriveHealthStatus(r.data);
           site.markModified('latest');
           await site.save();
         }
@@ -258,61 +207,12 @@ router.delete('/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /api/sites/:id/sync — fire-and-forget: replies immediately, syncs in background.
-// Safe to refresh the frontend — the backend continues running regardless.
-// Multiple different sites can sync at the same time.
-router.post('/:id/sync', async (req, res) => {
-  const site = await Site.findById(req.params.id).lean();
-  if (!site) return res.status(404).json({ ok: false, error: 'Not found' });
-
-  const key = String(site._id);
-  const existing = syncJobs.get(key);
-  if (existing && existing.status === 'running') {
-    return res.json({ ok: true, status: 'running', startedAt: existing.startedAt });
-  }
-
-  const startedAt = new Date();
-  syncJobs.set(key, { status: 'running', startedAt, finishedAt: null, error: null });
-
-  // Reply immediately — frontend is unblocked
-  res.json({ ok: true, status: 'started', startedAt });
-
-  // Run the actual sync in the background (survives page refresh)
-  ;(async () => {
-    try {
-      const r = await callConnector(site.url, site.apiKey, '/data', 60000);
-      if (r.status !== 200) {
-        await Snapshot.create({ site: site._id, ok: false, error: `HTTP ${r.status}`, data: r.data });
-        await Site.findByIdAndUpdate(site._id, { status: 'offline', lastCheckedAt: new Date() });
-        syncJobs.set(key, { status: 'error', startedAt, finishedAt: new Date(), error: `Site returned ${r.status}` });
-        return;
-      }
-      await Snapshot.create({ site: site._id, ok: true, data: r.data });
-      const summary = computeSummary(r.data);
-      await Site.findByIdAndUpdate(site._id, {
-        $set: {
-          status: 'online',
-          lastCheckedAt: new Date(),
-          lastSyncedAt: new Date(),
-          latest: summary,
-          ...(r.data?.site?.wp_version ? { wpVersion: r.data.site.wp_version } : {}),
-        },
-      });
-      syncJobs.set(key, { status: 'done', startedAt, finishedAt: new Date(), error: null });
-    } catch (e) {
-      await Snapshot.create({ site: site._id, ok: false, error: e.message }).catch(() => {});
-      await Site.findByIdAndUpdate(site._id, { status: 'offline', lastCheckedAt: new Date() }).catch(() => {});
-      syncJobs.set(key, { status: 'error', startedAt, finishedAt: new Date(), error: e.message });
-    }
-  })();
-});
-
-// GET /api/sites/:id/sync/status — poll whether a sync is running/done/error
-router.get('/:id/sync/status', (req, res) => {
-  const job = syncJobs.get(req.params.id);
-  if (!job) return res.json({ ok: true, status: 'idle' });
-  res.json({ ok: true, ...job });
-});
+// NOTE: the old manual "POST /:id/sync" + "GET /:id/sync/status" endpoints
+// (and the syncJobs in-memory tracker) are gone. Security-data syncing is no
+// longer a manually-triggered, per-site action — it now runs automatically
+// once a day for every site via services/scanAllSites.js, triggered by the
+// GitHub Actions workflow .github/workflows/daily-scan.yml hitting the
+// protected POST /api/scan/run-all endpoint (see routes/scan.js).
 
 // GET /api/sites/:id/latest — most recent snapshot
 router.get('/:id/latest', async (req, res) => {
@@ -321,7 +221,9 @@ router.get('/:id/latest', async (req, res) => {
   res.json({ ok: true, snapshot: snap });
 });
 
-// GET /api/sites/:id/history?days=7 — score history for chart
+// GET /api/sites/:id/history?days=7 — Site Health point history for chart.
+// No numeric score anymore — returns the raw good/recommended/critical
+// counts per snapshot so the frontend can chart those directly.
 router.get('/:id/history', async (req, res) => {
   const days = Math.min(parseInt(req.query.days || '7', 10), 90);
   const since = new Date(Date.now() - days * 86400000);
@@ -329,10 +231,16 @@ router.get('/:id/history', async (req, res) => {
     .sort({ fetchedAt: 1 })
     .select('fetchedAt data')
     .lean();
-  const points = snaps.map(s => ({
-    date: s.fetchedAt,
-    score: s.data?.summary?.score ?? s.data?.score ?? null,
-  })).filter(p => p.score != null);
+  const points = snaps.map(s => {
+    const health = s.data?.health?.summary;
+    if (!health) return null;
+    return {
+      date: s.fetchedAt,
+      critical: health.critical || 0,
+      recommended: health.recommended || 0,
+      good: health.good || 0,
+    };
+  }).filter(Boolean);
   res.json({ ok: true, points });
 });
 

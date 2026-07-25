@@ -1,23 +1,31 @@
 // Standalone entry point for the OTP-email-delivery monitor — runs OUTSIDE
-// of the main server.js process, same reasoning as scripts/runScreenshots.js:
-// shared cPanel Node.js hosting can't run Playwright/Chromium, so this runs
-// on a schedule via GitHub Actions instead — see
-// .github/workflows/otp-check.yml.
+// of the main server.js process, same reasoning as scripts/runScreenshots.js
+// (shared cPanel Node.js hosting has restrictions that make this cleaner to
+// run via GitHub Actions on a schedule instead — see
+// .github/workflows/otp-check.yml).
 //
-// What it does:
-//   1. Connects to the same MongoDB Atlas database the cPanel backend uses.
-//   2. Finds the BoloCart Site doc and its most recent Snapshot.
-//   3. Derives Layer 1 (plugin active?) + Layer 2 (SMTP configured?) status
-//      from that snapshot — no new WordPress call needed.
-//   4. If prerequisites aren't met, skips the browser/IMAP step entirely.
-//   5. Otherwise runs the full Playwright + IMAP Layer 3 check.
-//   6. Persists everything as an OtpCheck document.
-//   7. Exits 0 on pass, 1 on any real failure (so GitHub Actions shows red).
+// Runs across EVERY registered site, not just one hardcoded store — this is
+// meant to scale to however many client sites get added later, the same way
+// screenshots/scans/pagespeed already do. For each site:
+//   1. Derives Layer 1 (OTP plugin active?) + Layer 2 (SMTP configured?)
+//      status from that site's most recent Snapshot — no new WordPress call
+//      needed, this data is already collected on every daily scan.
+//   2. If a site doesn't have the OTP plugin active (or SMTP isn't
+//      configured), Layer 3 is skipped for THAT site only — other sites
+//      keep being checked normally. There's no assumption that every site
+//      even has this OTP feature.
+//   3. Otherwise, triggers the plugin's own "send_otp" AJAX action directly
+//      (POST {site.url}/wp-admin/admin-ajax.php, action=send_otp&email=...)
+//      and verifies delivery via IMAP against the one shared test mailbox.
+//      No per-site URL configuration needed in .env — every site's own
+//      `url` field (already stored from registration) is reused, just with
+//      "/wp-admin/admin-ajax.php" appended. Adding a 21st site tomorrow
+//      requires zero changes here.
+//   4. Persists one OtpCheck document per site.
 //
 // Usage: node scripts/runOtpCheck.js
 // Required env vars: MONGO_URI, OTP_TEST_EMAIL, OTP_TEST_EMAIL_PASSWORD,
-// OTP_IMAP_HOST, and optionally OTP_IMAP_PORT, BOLOCART_SHOP_URL,
-// BOLOCART_CHECKOUT_URL, OTP_TEST_CITY.
+// OTP_IMAP_HOST, and optionally OTP_IMAP_PORT.
 import 'dotenv/config';
 import mongoose from 'mongoose';
 import Site from '../models/Site.js';
@@ -33,27 +41,18 @@ if (!MONGO_URI) {
 }
 
 function computeOverallStatus({ otpPluginActive, smtpPluginActive, smtpConfigured, layer3Attempted, popupAppeared, emailFound }) {
-  if (otpPluginActive === false || smtpPluginActive === false) return 'fail_plugin_inactive';
+  if (otpPluginActive === null) return 'not_applicable'; // no snapshot yet — nothing to report either way
+  if (otpPluginActive === false) return 'not_applicable'; // this site doesn't run the OTP plugin at all — not a failure
+  if (smtpPluginActive === false) return 'fail_plugin_inactive';
   if (smtpConfigured === false) return 'fail_smtp_not_configured';
-  if (!layer3Attempted) return 'error'; // prereqs looked fine (or unknown) but we still couldn't run Layer 3
+  if (!layer3Attempted) return 'error';
   if (!popupAppeared) return 'fail_checkout_trigger';
   if (!emailFound) return 'fail_email_not_received';
   return 'pass';
 }
 
-async function main() {
-  console.log('[runOtpCheck] connecting to MongoDB...');
-  await mongoose.connect(MONGO_URI);
-  console.log('[runOtpCheck] connected.');
-
-  const site = await Site.findOne({ url: { $regex: /bolocart\.com/i } }).lean();
-  if (!site) {
-    console.error('[runOtpCheck] No site found matching "bolocart.com" in the Site collection — aborting.');
-    await mongoose.disconnect();
-    process.exit(1);
-    return;
-  }
-  console.log(`[runOtpCheck] found site: ${site.name || site.url} (${site._id})`);
+async function checkOneSite(site) {
+  console.log(`\n[runOtpCheck] --- ${site.name || site.url} (${site._id}) ---`);
 
   const snap = await Snapshot.findOne({ site: site._id, ok: true }).sort({ fetchedAt: -1 }).lean();
   const prereq = deriveOtpPrereqStatus(snap?.data);
@@ -75,13 +74,18 @@ async function main() {
     deliveryLatencyMs: null,
   };
 
-  if (!prereq.readyForLayer3) {
-    console.log('[runOtpCheck] prerequisites not met — skipping Layer 3 (browser/IMAP).');
+  if (prereq.otpPluginActive === null) {
+    console.log('[runOtpCheck] no snapshot data yet for this site — skipping until the next daily scan runs.');
+  } else if (prereq.otpPluginActive === false) {
+    console.log('[runOtpCheck] OTP plugin not active on this site — not applicable, skipping.');
+  } else if (!prereq.readyForLayer3) {
+    console.log('[runOtpCheck] prerequisites not met — skipping Layer 3 (AJAX + IMAP).');
   } else {
-    console.log('[runOtpCheck] prerequisites OK — running Layer 3 (Playwright + IMAP)...');
+    console.log('[runOtpCheck] prerequisites OK — running Layer 3 (AJAX trigger + IMAP)...');
     record.layer3Attempted = true;
     try {
-      const l3 = await runOtpCheck();
+      const ajaxUrl = `${String(site.url).replace(/\/$/, '')}/wp-admin/admin-ajax.php`;
+      const l3 = await runOtpCheck({ ajaxUrl });
       record.popupAppeared = l3.popupAppeared;
       record.popupError = l3.popupError;
       record.emailFound = l3.emailFound;
@@ -108,15 +112,40 @@ async function main() {
   console.log(`[runOtpCheck] overallStatus: ${record.overallStatus}`);
 
   await OtpCheck.create(record);
+  return record.overallStatus;
+}
+
+async function main() {
+  console.log('[runOtpCheck] connecting to MongoDB...');
+  await mongoose.connect(MONGO_URI);
+  console.log('[runOtpCheck] connected.');
+
+  const sites = await Site.find().lean();
+  if (!sites.length) {
+    console.log('[runOtpCheck] no sites registered yet — nothing to check.');
+    await mongoose.disconnect();
+    process.exit(0);
+    return;
+  }
+  console.log(`[runOtpCheck] checking ${sites.length} site(s)...`);
+
+  let anyFailed = false;
+  for (const site of sites) {
+    try {
+      const status = await checkOneSite(site);
+      if (status !== 'pass' && status !== 'not_applicable') anyFailed = true;
+    } catch (e) {
+      console.error(`[runOtpCheck] site ${site._id} (${site.url}) failed unexpectedly:`, e.message);
+      anyFailed = true;
+    }
+  }
 
   await mongoose.disconnect();
 
-  // Exit 0 when the check passed OR correctly skipped Layer 3 with no
-  // prerequisite issue (shouldn't really happen — readyForLayer3 false always
-  // implies a prereq problem — but guards against an 'error' status from an
-  // unexpected code path). Exit 1 for anything that represents a real failure.
-  const passing = record.overallStatus === 'pass';
-  process.exit(passing ? 0 : 1);
+  // Exit 1 if ANY site had a real OTP-delivery failure, so GitHub Actions
+  // shows a red X worth investigating. Sites where the OTP plugin simply
+  // isn't installed ('not_applicable') don't count as failures.
+  process.exit(anyFailed ? 1 : 0);
 }
 
 main().catch(async (e) => {

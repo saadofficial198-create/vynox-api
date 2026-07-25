@@ -1,121 +1,49 @@
-import { chromium } from 'playwright';
+import axios from 'axios';
 import { checkForOtpEmail } from './imapCheck.js';
 
-// Layer 3 of the OTP-email-delivery monitor: actually drives the BoloCart
-// checkout flow end-to-end (add to cart -> checkout -> fill form -> place
-// order) and confirms the OTP popup appears, then checks the test inbox via
-// IMAP to confirm the email actually arrived. See services/imapCheck.js for
-// the IMAP half and services/otpLayers.js for the cheap Layer 1/2 checks
-// that gate whether this even runs.
+// Layer 3 of the OTP-email-delivery monitor.
 //
-// IMPORTANT: this deliberately stops the moment #otp-popup appears. It never
-// fills in the OTP code or clicks "Verify OTP" — confirmed via live manual
-// testing that no WooCommerce order is created unless the OTP is verified,
-// so no cleanup logic is needed here.
+// Originally this drove a full headless-browser checkout flow (add to cart,
+// fill the billing form, click "Place order") to trigger the OTP email. That
+// turned out to be unnecessarily fragile — after reading the actual OTP
+// plugin source (woocommerce-email-otp.php), the real trigger is just a
+// plain WordPress AJAX call the plugin's own JS makes when "Place order" is
+// clicked:
+//
+//   POST {site}/wp-admin/admin-ajax.php
+//   Content-Type: application/x-www-form-urlencoded
+//   Body: action=send_otp&email=<billing email>
+//
+// (see add_action('wp_ajax_nopriv_send_otp', 'send_otp') in the plugin — it's
+// registered for both logged-in AND logged-out ("nopriv") users, requires no
+// nonce/cart/session state, and just rand()s a 6-digit OTP, stores it in the
+// WC session, and calls wp_mail(). So hitting this endpoint directly with a
+// plain HTTP POST is the exact same server-side action a real "Place order"
+// click causes — no browser, no cart, no checkout form needed at all.
+//
+// This is generic to any site running this same OTP plugin (the action name
+// "send_otp" and the "email" field are the plugin's fixed contract) — the
+// AJAX URL is passed in per-call (derived from that site's own `url` field
+// already stored in MongoDB, see scripts/runOtpCheck.js), NOT hardcoded to
+// any one site. Adding another site with this plugin requires zero .env
+// changes — the caller just builds `${site.url}/wp-admin/admin-ajax.php`.
+//
+// IMPORTANT: this deliberately never calls the "verify_otp" action — we only
+// trigger the send, then confirm delivery via IMAP. No WooCommerce order is
+// created by any of this (verify_otp + a real form submit would be needed
+// for that), so there's nothing to clean up.
 
-const SHOP_URL     = process.env.BOLOCART_SHOP_URL || 'https://bolocart.com/shop/';
-const CHECKOUT_URL = process.env.BOLOCART_CHECKOUT_URL || 'https://bolocart.com/checkout/';
-const TEST_CITY    = process.env.OTP_TEST_CITY || 'Karachi';
-
-const POPUP_TIMEOUT_MS = 30_000;
-const NAV_TIMEOUT_MS = 60_000;
-const FIELD_TIMEOUT_MS = 45_000;
-
-function billingFixtures() {
-  const email = process.env.OTP_TEST_EMAIL;
-  if (!email) {
-    throw new Error('OTP_TEST_EMAIL is not set — required as the checkout billing email and IMAP mailbox to poll');
-  }
-  return {
-    firstName: 'Vynox',
-    lastName: 'Test',
-    address1: 'Test Street 123',
-    city: TEST_CITY,
-    postcode: '75000',
-    phone: '03001234567',
-    email,
-  };
-}
-
-/** Adds the first available product to the cart from the shop page. Falls back to a retry if the click is flaky. */
-async function addFirstProductToCart(page) {
-  // 'domcontentloaded' instead of 'networkidle': sites with persistent
-  // background requests (chat widgets, analytics beacons, etc.) can make
-  // 'networkidle' never resolve, burning the whole nav timeout before the
-  // form is even usable. We wait for the specific elements we need instead.
-  await page.goto(SHOP_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-
-  const addToCartBtn = page.locator('.add_to_cart_button').first();
-  await addToCartBtn.waitFor({ state: 'visible', timeout: FIELD_TIMEOUT_MS });
-
-  // One retry: WooCommerce AJAX add-to-cart buttons occasionally need a
-  // second click if the first fires before the button's JS handler is bound.
-  let lastErr = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      await addToCartBtn.click({ timeout: 10_000 });
-      // WooCommerce adds an "added" class / shows a "View cart" link on success.
-      await page.waitForTimeout(2000);
-      return;
-    } catch (e) {
-      lastErr = e;
-      await page.waitForTimeout(1000);
-    }
-  }
-  throw lastErr || new Error('add_to_cart_button click failed');
-}
-
-async function fillCheckoutForm(page, fixtures) {
-  await page.goto(CHECKOUT_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-
-  // Explicit wait for the actual field we need, rather than trusting
-  // 'networkidle' — WooCommerce checkout renders the form via a fragment
-  // request after initial page load, so the field may not exist yet even
-  // after 'domcontentloaded' fires.
-  const firstNameField = page.locator('#billing_first_name');
-  try {
-    await firstNameField.waitFor({ state: 'visible', timeout: FIELD_TIMEOUT_MS });
-  } catch (e) {
-    // Add diagnostic context (current URL/title) so failures are easier to
-    // tell apart later — e.g. "redirected to /cart/ because it was empty"
-    // vs. "checkout page itself is just slow/broken".
-    throw new Error(`${e.message} (current URL: ${page.url()}, title: "${await page.title().catch(() => '?')}")`);
-  }
-
-  await firstNameField.fill(fixtures.firstName);
-  await page.locator('#billing_last_name').fill(fixtures.lastName);
-  // billing_country / billing_state left untouched — already default to
-  // Pakistan / Sindh per the confirmed live DOM inspection.
-  await page.locator('#billing_address_1').fill(fixtures.address1);
-  await page.locator('#billing_city').fill(fixtures.city);
-  await page.locator('#billing_postcode').fill(fixtures.postcode);
-  await page.locator('#billing_phone').fill(fixtures.phone);
-  await page.locator('#billing_email').fill(fixtures.email);
-
-  const terms = page.locator('#terms');
-  if (await terms.count()) {
-    // Playwright's .check() reported "click did not change state" — some
-    // themes hide the real checkbox behind custom CSS/a styled label, so a
-    // synthetic mouse click on the (possibly zero-size/hidden) native input
-    // doesn't register. Setting checked directly via JS and firing the
-    // events WooCommerce's validation listens for is more reliable here.
-    await terms.evaluate((el) => {
-      el.checked = true;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('click', { bubbles: true }));
-    });
-  }
-
-  // Payment method: "Cash on delivery" is already selected by default —
-  // intentionally not touched here.
-}
+const REQUEST_TIMEOUT_MS = 20_000;
 
 /**
- * Runs the full Layer 3 checkout-trigger + IMAP verification.
+ * Triggers the OTP send by calling the plugin's own AJAX endpoint directly,
+ * then verifies the email actually arrived via IMAP.
+ * @param {{ ajaxUrl: string }} opts - ajaxUrl: that site's own
+ *   "{url}/wp-admin/admin-ajax.php" — every site provides its own, so this
+ *   function has no knowledge of which site it's checking.
  * @returns {Promise<{
  *   triggeredAt: Date,
- *   popupAppeared: boolean,
+ *   popupAppeared: boolean,   // kept for schema/back-compat with OtpCheck model — true means "trigger call succeeded" (no popup involved anymore)
  *   popupError: string|null,
  *   emailFound: boolean|null,
  *   emailCheckError: string|null,
@@ -123,13 +51,19 @@ async function fillCheckoutForm(page, fixtures) {
  *   otpCode: string|null,
  * }>}
  */
-export async function runOtpCheck() {
-  const fixtures = billingFixtures(); // throws early with a clear error if OTP_TEST_EMAIL is missing
+export async function runOtpCheck({ ajaxUrl }) {
+  if (!ajaxUrl) {
+    throw new Error('runOtpCheck requires { ajaxUrl } — the target site\'s own admin-ajax.php URL');
+  }
 
-  let browser;
-  let result = {
+  const email = process.env.OTP_TEST_EMAIL;
+  if (!email) {
+    throw new Error('OTP_TEST_EMAIL is not set — required as the target email for the send_otp AJAX call and the IMAP mailbox to poll');
+  }
+
+  const result = {
     triggeredAt: null,
-    popupAppeared: false,
+    popupAppeared: false, // "trigger succeeded" — name kept for compatibility with the rest of the pipeline
     popupError: null,
     emailFound: null,
     emailCheckError: null,
@@ -138,41 +72,28 @@ export async function runOtpCheck() {
   };
 
   try {
-    browser = await chromium.launch({ headless: true });
-    const ctx = await browser.newContext({ viewport: { width: 1366, height: 900 } });
-    const page = await ctx.newPage();
-
-    try {
-      await addFirstProductToCart(page);
-    } catch (e) {
-      // Fallback: navigate straight to checkout anyway — some carts persist
-      // via session/cookies from an earlier redirect, or the site allows
-      // checkout to proceed to an empty-cart notice we can still detect via
-      // the popup timeout below. Better to attempt checkout than to abort
-      // entirely on a flaky add-to-cart click.
-      console.warn('[otpCheck] addFirstProductToCart failed, attempting checkout anyway:', e.message);
-    }
-
-    await fillCheckoutForm(page, fixtures);
-
-    const placeOrderBtn = page.locator('#place_order');
-    await placeOrderBtn.waitFor({ state: 'visible', timeout: NAV_TIMEOUT_MS });
-
     result.triggeredAt = new Date();
-    await placeOrderBtn.click();
+    const res = await axios.post(
+      ajaxUrl,
+      new URLSearchParams({ action: 'send_otp', email }).toString(),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: REQUEST_TIMEOUT_MS,
+        validateStatus: () => true,
+      }
+    );
 
-    try {
-      await page.waitForSelector('#otp-popup', { state: 'visible', timeout: POPUP_TIMEOUT_MS });
+    const ok = res.status === 200 && res.data && res.data.success === true;
+    if (ok) {
       result.popupAppeared = true;
-    } catch (e) {
+    } else {
       result.popupAppeared = false;
-      result.popupError = `#otp-popup did not appear within ${POPUP_TIMEOUT_MS}ms: ${e.message}`;
+      const serverMsg = res.data?.data?.message || JSON.stringify(res.data);
+      result.popupError = `send_otp AJAX call did not report success (HTTP ${res.status}): ${serverMsg}`;
     }
   } catch (e) {
     result.popupAppeared = false;
-    result.popupError = e.message;
-  } finally {
-    await browser?.close().catch(() => {});
+    result.popupError = `send_otp AJAX call failed: ${e.message}`;
   }
 
   if (!result.popupAppeared) {

@@ -2,12 +2,10 @@ name: OTP email delivery check
 
 # Verifies BoloCart's WooCommerce Email OTP Verification flow actually works
 # end-to-end: plugin active (Layer 1) -> WP Mail SMTP configured (Layer 2) ->
-# checkout triggers the OTP popup and the email actually lands in the inbox
-# (Layer 3, via Playwright + IMAP). See services/otpCheck.js,
+# the plugin's own "send_otp" AJAX endpoint accepts a request and the email
+# actually lands in the inbox (Layer 3, via a plain HTTP call + IMAP — no
+# browser needed, see services/otpCheck.js for why). See also
 # services/otpLayers.js, services/imapCheck.js, scripts/runOtpCheck.js.
-#
-# Runs on GitHub's free Ubuntu runners (same reasoning as screenshots.yml —
-# shared cPanel Node.js hosting cannot run Playwright/Chromium).
 #
 # Times are in UTC. Aligned with the daily-scan and screenshot schedules:
 # 2x/day, 12:00 AM and 12:00 PM PKT.
@@ -20,7 +18,7 @@ on:
 jobs:
   otp-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10 # single-site check, much faster than the multi-site screenshot job
+    timeout-minutes: 5 # just an HTTP call + a few IMAP polls now — no browser
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -32,9 +30,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
-
-      - name: Install Playwright's Chromium + OS dependencies
-        run: npx playwright install --with-deps chromium
 
       - name: Run OTP delivery check
         env:

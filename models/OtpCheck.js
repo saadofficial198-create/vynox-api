@@ -29,7 +29,9 @@ const OtpCheckSchema = new mongoose.Schema(
 
     overallStatus: {
       type: String,
-      enum: ['pass', 'fail_plugin_inactive', 'fail_smtp_not_configured', 'fail_checkout_trigger', 'fail_email_not_received', 'error'],
+      // 'not_applicable' = this site doesn't have the OTP plugin active (or
+      // has no snapshot yet) — not a failure, just "nothing to check here".
+      enum: ['pass', 'not_applicable', 'fail_plugin_inactive', 'fail_smtp_not_configured', 'fail_checkout_trigger', 'fail_email_not_received', 'error'],
       required: true,
     },
   },

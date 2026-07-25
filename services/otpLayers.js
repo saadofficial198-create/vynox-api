@@ -20,13 +20,27 @@ const SMTP_PLUGIN_RE = /wp mail smtp/i;
  * }}
  */
 export function deriveOtpPrereqStatus(snapshotData) {
+  // No snapshot at all yet (brand-new site, first scan hasn't run) — we
+  // genuinely don't know anything, so everything stays null rather than
+  // being reported as "plugin not active" (which would be misleading).
+  if (!snapshotData) {
+    return { otpPluginActive: null, smtpPluginActive: null, smtpConfigured: null, smtpMailer: null, readyForLayer3: false };
+  }
+
   const plugins = Array.isArray(snapshotData?.plugins?.plugins) ? snapshotData.plugins.plugins : [];
 
   const otpPlugin  = plugins.find(p => OTP_PLUGIN_RE.test(p?.name || ''));
   const smtpPlugin = plugins.find(p => SMTP_PLUGIN_RE.test(p?.name || ''));
 
-  const otpPluginActive  = otpPlugin  ? otpPlugin.status === 'active'  : null;
-  const smtpPluginActive = smtpPlugin ? smtpPlugin.status === 'active' : null;
+  // false (not null) when the plugin isn't in the list at all — "not
+  // installed" and "installed but deactivated" both mean "OTP flow can't
+  // possibly work right now", and the caller (scripts/runOtpCheck.js) needs
+  // to tell "this site simply doesn't have the OTP feature" (not_applicable)
+  // apart from "no plugin data yet" (only possible via a missing snapshot,
+  // handled separately below by returning null when snapshotData itself is
+  // absent).
+  const otpPluginActive  = otpPlugin  ? otpPlugin.status === 'active'  : false;
+  const smtpPluginActive = smtpPlugin ? smtpPlugin.status === 'active' : false;
 
   const mailSmtp = snapshotData?.mail_smtp || null;
   const smtpConfigured = typeof mailSmtp?.configured === 'boolean' ? mailSmtp.configured : null;

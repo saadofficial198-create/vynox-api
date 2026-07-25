@@ -6,13 +6,12 @@ name: Capture site screenshots
 # services/screenshot.js for the full explanation.
 #
 # Times are in UTC. Adjust to match when you want captures in your local
-# time zone (Pakistan is UTC+5, so e.g. "0 4,10,16 * * *" = 09:00, 15:00,
-# 21:00 PKT). Currently set to 2x/day per the cost-conscious plan discussed;
-# add a third cron line to go back to 3x/day.
+# time zone (Pakistan is UTC+5). Currently set to 2x/day, aligned with the
+# daily security scan: 12:00 AM and 12:00 PM PKT.
 on:
   schedule:
-    - cron: '0 4 * * *'   # 09:00 PKT
-    - cron: '0 10 * * *'  # 15:00 PKT
+    - cron: '0 19 * * *'  # 00:00 PKT (midnight) — 19:00 UTC previous day
+    - cron: '0 7 * * *'   # 12:00 PKT (noon)
   workflow_dispatch: {}    # lets you trigger a run manually from the Actions tab
 
 jobs:

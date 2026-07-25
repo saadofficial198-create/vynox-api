@@ -12,12 +12,12 @@ name: Daily security scan
 # protected HTTP endpoint. This job is much simpler though — no Node/
 # Playwright setup, just a single curl call.
 #
-# Time is in UTC. 03:00 UTC = 08:00 PKT (Pakistan is UTC+5) — picked as an
-# off-peak time, well clear of the screenshot capture windows (04:00/10:00
-# UTC) in screenshots.yml.
+# Time is in UTC (Pakistan is UTC+5). Runs 2x/day, aligned with the
+# screenshot capture schedule: 12:00 AM and 12:00 PM PKT.
 on:
   schedule:
-    - cron: '0 3 * * *'  # 08:00 PKT
+    - cron: '0 19 * * *'  # 00:00 PKT (midnight) — 19:00 UTC previous day
+    - cron: '0 7 * * *'   # 12:00 PKT (noon)
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 jobs:

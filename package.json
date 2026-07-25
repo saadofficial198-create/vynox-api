@@ -20,6 +20,8 @@
     "pngjs": "^7.0.0",
     "basic-ftp": "^5.0.5",
     "sharp": "^0.33.5",
-    "nodemailer": "^6.9.15"
+    "nodemailer": "^6.9.15",
+    "imapflow": "^1.0.98",
+    "mailparser": "^3.7.1"
   }
 }

@@ -12,6 +12,7 @@ import backupsRouter from './routes/backups.js';
 import pagespeedRouter from './routes/pagespeed.js';
 import screenshotsRouter from './routes/screenshots.js';
 import scanRouter from './routes/scan.js';
+import otpCheckRouter from './routes/otpCheck.js';
 import Site from './models/Site.js';
 import { checkAllSitesPageSpeed } from './services/pagespeed.js';
 // NOTE: screenshot capture (Playwright/Chromium) does NOT run on this cPanel
@@ -53,6 +54,7 @@ app.use('/api/backups', backupsRouter);
 app.use('/api/pagespeed', pagespeedRouter);
 app.use('/api/screenshots', screenshotsRouter);
 app.use('/api/scan', scanRouter);
+app.use('/api/otp-check', otpCheckRouter);
 
 app.use((err, _req, res, _next) => {
   console.error('[ERR]', err);

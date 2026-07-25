@@ -29,7 +29,9 @@ jobs:
         run: |
           status=$(curl -s -o /tmp/response.txt -w "%{http_code}" -X POST \
             "https://vynox.progamesgears.com/api/scan/run-all" \
-            -H "X-Scan-Secret: ${{ secrets.SCAN_TRIGGER_SECRET }}")
+            -H "X-Scan-Secret: ${{ secrets.SCAN_TRIGGER_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{}")
           echo "Response body:"
           cat /tmp/response.txt
           echo ""

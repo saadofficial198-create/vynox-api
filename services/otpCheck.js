@@ -17,8 +17,9 @@ const SHOP_URL     = process.env.BOLOCART_SHOP_URL || 'https://bolocart.com/shop
 const CHECKOUT_URL = process.env.BOLOCART_CHECKOUT_URL || 'https://bolocart.com/checkout/';
 const TEST_CITY    = process.env.OTP_TEST_CITY || 'Karachi';
 
-const POPUP_TIMEOUT_MS = 20_000;
-const NAV_TIMEOUT_MS = 45_000;
+const POPUP_TIMEOUT_MS = 30_000;
+const NAV_TIMEOUT_MS = 60_000;
+const FIELD_TIMEOUT_MS = 45_000;
 
 function billingFixtures() {
   const email = process.env.OTP_TEST_EMAIL;
@@ -38,10 +39,14 @@ function billingFixtures() {
 
 /** Adds the first available product to the cart from the shop page. Falls back to a retry if the click is flaky. */
 async function addFirstProductToCart(page) {
-  await page.goto(SHOP_URL, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT_MS });
+  // 'domcontentloaded' instead of 'networkidle': sites with persistent
+  // background requests (chat widgets, analytics beacons, etc.) can make
+  // 'networkidle' never resolve, burning the whole nav timeout before the
+  // form is even usable. We wait for the specific elements we need instead.
+  await page.goto(SHOP_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
   const addToCartBtn = page.locator('.add_to_cart_button').first();
-  await addToCartBtn.waitFor({ state: 'visible', timeout: NAV_TIMEOUT_MS });
+  await addToCartBtn.waitFor({ state: 'visible', timeout: FIELD_TIMEOUT_MS });
 
   // One retry: WooCommerce AJAX add-to-cart buttons occasionally need a
   // second click if the first fires before the button's JS handler is bound.
@@ -61,9 +66,23 @@ async function addFirstProductToCart(page) {
 }
 
 async function fillCheckoutForm(page, fixtures) {
-  await page.goto(CHECKOUT_URL, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT_MS });
+  await page.goto(CHECKOUT_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
-  await page.locator('#billing_first_name').fill(fixtures.firstName);
+  // Explicit wait for the actual field we need, rather than trusting
+  // 'networkidle' — WooCommerce checkout renders the form via a fragment
+  // request after initial page load, so the field may not exist yet even
+  // after 'domcontentloaded' fires.
+  const firstNameField = page.locator('#billing_first_name');
+  try {
+    await firstNameField.waitFor({ state: 'visible', timeout: FIELD_TIMEOUT_MS });
+  } catch (e) {
+    // Add diagnostic context (current URL/title) so failures are easier to
+    // tell apart later — e.g. "redirected to /cart/ because it was empty"
+    // vs. "checkout page itself is just slow/broken".
+    throw new Error(`${e.message} (current URL: ${page.url()}, title: "${await page.title().catch(() => '?')}")`);
+  }
+
+  await firstNameField.fill(fixtures.firstName);
   await page.locator('#billing_last_name').fill(fixtures.lastName);
   // billing_country / billing_state left untouched — already default to
   // Pakistan / Sindh per the confirmed live DOM inspection.

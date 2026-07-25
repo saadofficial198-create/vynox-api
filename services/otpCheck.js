@@ -94,7 +94,17 @@ async function fillCheckoutForm(page, fixtures) {
 
   const terms = page.locator('#terms');
   if (await terms.count()) {
-    await terms.check({ force: true });
+    // Playwright's .check() reported "click did not change state" — some
+    // themes hide the real checkbox behind custom CSS/a styled label, so a
+    // synthetic mouse click on the (possibly zero-size/hidden) native input
+    // doesn't register. Setting checked directly via JS and firing the
+    // events WooCommerce's validation listens for is more reliable here.
+    await terms.evaluate((el) => {
+      el.checked = true;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('click', { bubbles: true }));
+    });
   }
 
   // Payment method: "Cash on delivery" is already selected by default —

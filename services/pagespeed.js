@@ -31,7 +31,11 @@ export async function fetchPageSpeed(fullUrl, strategy = 'mobile') {
   const params = new URLSearchParams({ url: fullUrl, key: apiKey, strategy });
   for (const c of CATEGORIES) params.append('category', c);
 
-  const { data } = await axios.get(`${API_URL}?${params.toString()}`, { timeout: 60000 });
+  // 120s (up from 60s) — when the target site's own server is under heavy
+  // CPU load (slow to respond), Google's Lighthouse crawler can take a long
+  // time to finish loading the page before it even gets to FAILED_DOCUMENT_REQUEST;
+  // a short axios timeout here just gives up on our side before Lighthouse does.
+  const { data } = await axios.get(`${API_URL}?${params.toString()}`, { timeout: 120000 });
 
   const lh = data.lighthouseResult;
   const cats = lh?.categories || {};
@@ -59,11 +63,16 @@ export async function fetchPageSpeed(fullUrl, strategy = 'mobile') {
   return { scores, vitals, raw: { fetchTime: lh?.fetchTime, finalUrl: lh?.finalUrl } };
 }
 
-const RETRY_ATTEMPTS = 3; // 1 initial try + 2 retries
-const RETRY_DELAY_MS = 8000; // Lighthouse/PageSpeed transient failures (timeouts,
-// FAILED_DOCUMENT_REQUEST, rate limits) are usually gone a few seconds later —
-// this is not a real problem with the page, just Google's crawler having a
-// bad moment, so we only record "Failed" once all attempts are exhausted.
+const RETRY_ATTEMPTS = 5; // 1 initial try + 4 retries (raised from 3 — cPanel
+// CPU load spikes were causing FAILED_DOCUMENT_REQUEST on nearly every page,
+// every time, so a couple of quick retries weren't enough headroom)
+const RETRY_DELAY_MS = 20000; // 20s between attempts (raised from 8s) — gives
+// the target site's own server more time to recover from a CPU spike before
+// Lighthouse/PageSpeed transient failures (timeouts, FAILED_DOCUMENT_REQUEST,
+// NO_FCP, rate limits) are usually gone a bit later — this is not a real
+// problem with the page, just Google's crawler (or the site's own server)
+// having a bad moment, so we only record "Failed" once all attempts are
+// exhausted.
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 

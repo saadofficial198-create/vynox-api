@@ -59,6 +59,14 @@ export async function fetchPageSpeed(fullUrl, strategy = 'mobile') {
   return { scores, vitals, raw: { fetchTime: lh?.fetchTime, finalUrl: lh?.finalUrl } };
 }
 
+const RETRY_ATTEMPTS = 3; // 1 initial try + 2 retries
+const RETRY_DELAY_MS = 8000; // Lighthouse/PageSpeed transient failures (timeouts,
+// FAILED_DOCUMENT_REQUEST, rate limits) are usually gone a few seconds later —
+// this is not a real problem with the page, just Google's crawler having a
+// bad moment, so we only record "Failed" once all attempts are exhausted.
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 /**
  * Runs PageSpeed checks for every monitoredPage of a single site (mobile
  * strategy only, to keep API usage low — desktop can be added later if needed),
@@ -70,21 +78,34 @@ export async function checkSitePageSpeed(site) {
 
   for (const page of pages) {
     const fullUrl = joinUrl(site.url, page.path);
-    try {
-      const { scores, vitals, raw } = await fetchPageSpeed(fullUrl, 'mobile');
-      const doc = await PageSpeedResult.create({
-        site: site._id,
-        pageLabel: page.label,
-        pagePath: page.path,
-        fullUrl,
-        strategy: 'mobile',
-        ok: true,
-        scores,
-        vitals,
-        raw,
-      });
-      results.push(doc);
-    } catch (e) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+      try {
+        const { scores, vitals, raw } = await fetchPageSpeed(fullUrl, 'mobile');
+        const doc = await PageSpeedResult.create({
+          site: site._id,
+          pageLabel: page.label,
+          pagePath: page.path,
+          fullUrl,
+          strategy: 'mobile',
+          ok: true,
+          scores,
+          vitals,
+          raw,
+        });
+        results.push(doc);
+        lastError = null;
+        break; // success — stop retrying this page
+      } catch (e) {
+        lastError = e;
+        const isLastAttempt = attempt === RETRY_ATTEMPTS;
+        console.log(`[pagespeed] ${fullUrl} attempt ${attempt}/${RETRY_ATTEMPTS} failed: ${e.response?.data?.error?.message || e.message}${isLastAttempt ? '' : ' — retrying...'}`);
+        if (!isLastAttempt) await sleep(RETRY_DELAY_MS);
+      }
+    }
+
+    if (lastError) {
       const doc = await PageSpeedResult.create({
         site: site._id,
         pageLabel: page.label,
@@ -92,7 +113,7 @@ export async function checkSitePageSpeed(site) {
         fullUrl,
         strategy: 'mobile',
         ok: false,
-        error: e.response?.data?.error?.message || e.message,
+        error: lastError.response?.data?.error?.message || lastError.message,
       });
       results.push(doc);
     }

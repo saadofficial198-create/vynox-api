@@ -14,6 +14,7 @@ import screenshotsRouter from './routes/screenshots.js';
 import scanRouter from './routes/scan.js';
 import otpCheckRouter from './routes/otpCheck.js';
 import Site from './models/Site.js';
+import JobLock from './models/JobLock.js';
 import { checkAllSitesPageSpeed } from './services/pagespeed.js';
 // NOTE: screenshot capture (Playwright/Chromium) does NOT run on this cPanel
 // backend anymore — shared cPanel Node.js hosting can't run a headless
@@ -118,19 +119,60 @@ async function pingMonitor() {
   }
 }
 
-// Guards so an overrunning PageSpeed/screenshot run can't overlap with itself
-// if a site is slow to respond and the next interval tick fires anyway.
-let pageSpeedRunning = false;
+// PageSpeed runs on a MongoDB-backed lock/lastRun record (models/JobLock.js),
+// NOT just an in-memory `running` flag — the in-memory version only protects
+// against overlap within a single process, but this app gets restarted
+// often (every code/env/.env change on cPanel), and a restart that doesn't
+// cleanly kill the previous process first can leave two Node processes
+// running simultaneously, each with its own 6h setInterval. That silently
+// multiplies Google PageSpeed API calls (this actually happened — PageSpeed
+// Insights showed ~2000 requests in 2 days for one 4-page site, when a few
+// hundred was the expected ceiling). The DB lock makes this safe regardless
+// of how many processes are alive: only one of them will ever see
+// `runningSince: null` and be allowed to proceed.
+const PAGESPEED_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const PAGESPEED_STALE_LOCK_MS = 30 * 60 * 1000; // if a run claims to still be "in progress" after 30 min, assume its process died mid-run and the lock is stale, not a real overlap
+
 async function pageSpeedJob() {
-  if (pageSpeedRunning) return console.log('[pagespeed] previous run still in progress, skipping tick');
-  pageSpeedRunning = true;
+  const key = 'pagespeed';
+  try {
+    const existing = await JobLock.findOne({ key });
+    const now = Date.now();
+
+    if (existing?.runningSince && now - existing.runningSince.getTime() < PAGESPEED_STALE_LOCK_MS) {
+      return console.log('[pagespeed] another process is already running a check, skipping this tick');
+    }
+    if (existing?.lastRunAt && now - existing.lastRunAt.getTime() < PAGESPEED_INTERVAL_MS) {
+      // Guards against the case where this process just booted and its own
+      // setTimeout fires immediately (see mongoose.connect().then() below) —
+      // if a run already happened recently (from this OR another process),
+      // don't run again just because this process is new.
+      return console.log('[pagespeed] last run was less than 6h ago, skipping this tick');
+    }
+
+    // Atomically claim the lock — findOneAndUpdate with upsert is a single
+    // Mongo operation, so two processes racing to start at the same instant
+    // can't both succeed.
+    await JobLock.findOneAndUpdate(
+      { key },
+      { $set: { runningSince: new Date() } },
+      { upsert: true }
+    );
+  } catch (e) {
+    console.error('[pagespeed] lock check failed, skipping this tick to be safe:', e.message);
+    return;
+  }
+
   try {
     const summary = await checkAllSitesPageSpeed();
     console.log('[pagespeed] run complete:', JSON.stringify(summary));
   } catch (e) {
     console.error('[pagespeed] run failed:', e.message);
   } finally {
-    pageSpeedRunning = false;
+    await JobLock.findOneAndUpdate(
+      { key },
+      { $set: { runningSince: null, lastRunAt: new Date() } }
+    ).catch((e) => console.error('[pagespeed] failed to release lock:', e.message));
   }
 }
 

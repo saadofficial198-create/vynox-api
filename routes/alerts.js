@@ -95,6 +95,33 @@ function deriveAlerts(site, snap) {
     push('failed-logins', 'Multiple Failed Logins', `${logins.failed_last_24h} failed login attempts in last 24h`, 'Login Security', 'high');
   }
 
+  // Page-selection health — these don't come from the snapshot's connector
+  // payload (they're about OUR monitoring config, not the site's own
+  // security), but deriveAlerts is the one place that already produces
+  // "currently detected" alerts each scan, so it's the natural spot for
+  // them. See models/Site.js's pagesConfigured + MonitoredPageSchema.
+  if (!site.pagesConfigured) {
+    push(
+      'pages-not-configured',
+      'Monitored Pages Not Configured',
+      'This site was registered but no pages have been selected for screenshots/PageSpeed yet. Open Settings and choose which pages to monitor — captures are paused until then.',
+      'Configuration',
+      'medium'
+    );
+  } else {
+    (site.monitoredPages || []).forEach((p) => {
+      if (p.enabled !== false && p.matchStatus === 'mismatch') {
+        push(
+          `page-mismatch-${p.label}`,
+          `Page Slug Changed: ${p.label}`,
+          `"${p.label}" (${p.path}) was not found in the site's sitemap during the last scan — the page may have been renamed or removed. Screenshot/PageSpeed capture for this page is paused. Re-select the correct page in Settings.`,
+          'Configuration',
+          'medium'
+        );
+      }
+    });
+  }
+
   return out;
 }
 

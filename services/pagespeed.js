@@ -80,9 +80,19 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
  * Runs PageSpeed checks for every monitoredPage of a single site (mobile
  * strategy only, to keep API usage low — desktop can be added later if needed),
  * saves one PageSpeedResult per page, and returns the array of saved docs.
+ *
+ * Skips any page that's disabled (page.enabled === false) or currently
+ * mismatched against the sitemap (page.matchStatus === 'mismatch' — see
+ * services/sitemapDetect.js's refreshPageMatchStatus and models/Site.js).
+ * Running a real Google PageSpeed check against a page whose slug no longer
+ * exists just burns API quota for a result that will always fail, and (like
+ * the equivalent screenshot skip in services/screenshot.js) risks recording
+ * a misleading score for the WRONG page if the slug now happens to resolve
+ * to something else entirely.
  */
 export async function checkSitePageSpeed(site) {
-  const pages = site.monitoredPages?.length ? site.monitoredPages : [{ label: 'Home', path: '/' }];
+  const allPages = site.monitoredPages?.length ? site.monitoredPages : [{ label: 'Home', path: '/' }];
+  const pages = allPages.filter(p => p.enabled !== false && p.matchStatus !== 'mismatch');
   const results = [];
 
   for (const page of pages) {
@@ -134,11 +144,25 @@ export async function checkSitePageSpeed(site) {
  * Runs PageSpeed checks for every site in the DB, one at a time (sequential
  * on purpose — Google's free tier is generous but we don't need to hammer it,
  * and running sites in parallel makes error messages harder to read in logs).
+ *
+ * Sites where pagesConfigured is still false are skipped entirely — same
+ * reasoning as services/screenshot.js's captureAllSites: a site the plugin
+ * just auto-registered hasn't had its page selection reviewed yet, so there's
+ * nothing meaningful to check against (the hardcoded default guesses are
+ * exactly what caused wrong-page/404 results before this feature existed).
+ *
+ * A single site throwing (network error, bad data, anything) is caught here
+ * and recorded in the summary — it never stops the loop for the rest of the
+ * sites.
  */
 export async function checkAllSitesPageSpeed() {
   const sites = await Site.find().lean(false); // full docs, need monitoredPages
   const summary = [];
   for (const site of sites) {
+    if (!site.pagesConfigured) {
+      summary.push({ site: site.name, ok: true, pages: 0, skipped: 'pagesConfigured is false — no page selection saved yet' });
+      continue;
+    }
     try {
       const results = await checkSitePageSpeed(site);
       summary.push({ site: site.name, ok: true, pages: results.length });

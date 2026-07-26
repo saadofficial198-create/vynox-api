@@ -66,7 +66,10 @@ export async function captureSitePage(browser, site, page) {
   try {
     ctx = await browser.newContext({ viewport: { width: 1366, height: 900 } });
     const tab = await ctx.newPage();
-    await tab.goto(fullUrl, { waitUntil: 'networkidle', timeout: 45000 });
+    // 25s (down from 45s) — long enough for a normally slow WordPress page,
+    // but short enough that one down/overloaded site can't eat minutes of
+    // the shared capture run for every other site queued behind it.
+    await tab.goto(fullUrl, { waitUntil: 'networkidle', timeout: 25000 });
     const pngBuffer = await tab.screenshot({ fullPage: true }); // Playwright only outputs png/jpeg natively; we take png then re-encode below for quality control
     const jpegBuffer = await sharp(pngBuffer).jpeg({ quality: JPEG_QUALITY }).toBuffer();
 
@@ -108,28 +111,74 @@ export async function captureSitePage(browser, site, page) {
   }
 }
 
-/** Captures every monitored page for one site. Reuses a single browser instance across pages. */
+/**
+ * Captures every monitored page for one site. Reuses a single browser
+ * instance across pages.
+ *
+ * Skips pages that are either explicitly disabled (page.enabled === false —
+ * the user turned it off in Settings without deleting it) or currently
+ * mismatched (page.matchStatus === 'mismatch' — the last daily scan
+ * couldn't find this path in the site's sitemap anymore, meaning the slug
+ * likely changed or the page was removed). Capturing a mismatched page
+ * would just screenshot a 404/wrong page and silently record it as if it
+ * were a real result, which is the exact problem this whole page-selection
+ * system exists to prevent — see models/Site.js's MonitoredPageSchema
+ * comment and services/sitemapDetect.js's refreshPageMatchStatus. Skipped
+ * pages are reported back to the caller (not just silently dropped) so
+ * captureAllSites() can surface them in its summary/logs.
+ */
 export async function captureSite(browser, site) {
-  const pages = site.monitoredPages?.length ? site.monitoredPages : [{ label: 'Home', path: '/' }];
+  const allPages = site.monitoredPages?.length ? site.monitoredPages : [{ label: 'Home', path: '/' }];
   const results = [];
-  for (const page of pages) {
+  const skipped = [];
+  for (const page of allPages) {
+    if (page.enabled === false) { skipped.push({ label: page.label, reason: 'disabled' }); continue; }
+    if (page.matchStatus === 'mismatch') { skipped.push({ label: page.label, reason: 'mismatch' }); continue; }
     results.push(await captureSitePage(browser, site, page));
   }
-  return results;
+  return { results, skipped };
 }
 
-/** Captures every monitored page for every site. Launches one browser for the whole run. */
+/**
+ * Captures every monitored page for every site. Launches one browser for
+ * the whole run.
+ *
+ * Sites where pagesConfigured is still false are skipped ENTIRELY (not one
+ * page at a time) — this covers a site the WordPress plugin just
+ * auto-registered, which starts with no reviewed page selection at all.
+ * Running screenshot capture against the hardcoded default guesses
+ * (Home/Shop/Contact Us/Track Order) before the user has confirmed real
+ * page slugs is exactly how "Contact Us" and "Track Your Order" ended up
+ * capturing 404 pages in practice — see models/Site.js's pagesConfigured
+ * comment. The user must open Settings and save a page selection (which
+ * flips pagesConfigured to true) before this site's captures begin; until
+ * then it shows up in the summary as skipped, and a persisted Alert (raised
+ * elsewhere, from routes/alerts.js's deriveAlerts) tells the user why.
+ *
+ * A single site's browser navigation crashing, timing out, or the site
+ * being completely down never stops the run for other sites — each site is
+ * wrapped in its own try/catch, same as before.
+ */
 export async function captureAllSites() {
   const sites = await Site.find().lean(false);
   const browser = await chromium.launch({ headless: true });
   const summary = [];
   try {
     for (const site of sites) {
+      if (!site.pagesConfigured) {
+        summary.push({ site: site.name, ok: true, pages: 0, skipped: 'pagesConfigured is false — no page selection saved yet' });
+        continue;
+      }
       try {
-        const results = await captureSite(browser, site);
+        const { results, skipped } = await captureSite(browser, site);
         const flagged = results.filter(r => r.diffFlagged).length;
-        summary.push({ site: site.name, ok: true, pages: results.length, flagged });
+        summary.push({
+          site: site.name, ok: true, pages: results.length, flagged,
+          ...(skipped.length ? { skippedPages: skipped } : {}),
+        });
       } catch (e) {
+        // Whatever happened, it's isolated to this one site — every other
+        // site in the loop still gets its turn.
         summary.push({ site: site.name, ok: false, error: e.message });
       }
     }

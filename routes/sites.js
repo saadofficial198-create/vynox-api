@@ -2,7 +2,7 @@ import express from 'express';
 import axios from 'axios';
 import Site from '../models/Site.js';
 import Snapshot from '../models/Snapshot.js';
-import { detectMonitoredPages } from '../services/sitemapDetect.js';
+import { detectMonitoredPages, detectSitemapCandidates } from '../services/sitemapDetect.js';
 import { deriveHealthStatus } from '../services/healthStatus.js';
 
 const router = express.Router();
@@ -100,18 +100,18 @@ router.post('/register', async (req, res) => {
         }
       } catch { /* registration already succeeded; ignore background errors */ }
 
-      // Best-effort: scan the site's sitemap for the real Shop/Contact Us/
-      // Track Order slugs so PageSpeed + screenshots hit the right pages
-      // instead of the hardcoded guesses. Never blocks registration.
-      try {
-        const { pages, source } = await detectMonitoredPages(cleaned);
-        site.monitoredPages = pages;
-        site.markModified('monitoredPages');
-        await site.save();
-        console.log(`[sitemap] ${cleaned}: pages detected via ${source}`);
-      } catch (e) {
-        console.log(`[sitemap] ${cleaned}: detection failed — ${e.message}`);
-      }
+      // NOTE: we deliberately do NOT auto-apply detectMonitoredPages() (or
+      // any hardcoded default) here anymore. A site the plugin just
+      // auto-registered starts with pagesConfigured: false, and
+      // screenshot/PageSpeed capture both skip any site where that's false
+      // (see services/screenshot.js, services/pagespeed.js) — an Alert is
+      // raised instead ("Monitored pages not configured yet"). The user
+      // must explicitly open Settings, review the live sitemap-detected
+      // page candidates (GET /:id/page-candidates), and save their
+      // selection (PUT /:id/monitored-pages) before any capture starts.
+      // This avoids silently running checks against wrong/404 pages using
+      // guessed slugs, which was the actual root cause of misleading
+      // "Failed" screenshots/PageSpeed results reported earlier.
     })();
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
@@ -153,19 +153,10 @@ router.post('/', async (req, res) => {
       notes: notes || '',
     });
     res.json({ ok: true, site });
-
-    // Best-effort, after responding: scan sitemap for real page slugs.
-    (async () => {
-      try {
-        const { pages, source } = await detectMonitoredPages(cleaned);
-        site.monitoredPages = pages;
-        site.markModified('monitoredPages');
-        await site.save();
-        console.log(`[sitemap] ${cleaned}: pages detected via ${source}`);
-      } catch (e) {
-        console.log(`[sitemap] ${cleaned}: detection failed — ${e.message}`);
-      }
-    })();
+    // Same as /register above: pagesConfigured defaults to false, and no
+    // page auto-detection is applied here — the user picks pages explicitly
+    // in Settings (GET /:id/page-candidates + PUT /:id/monitored-pages)
+    // before screenshot/PageSpeed capture will run for this site.
   } catch (e) {
     if (e.code === 11000) {
       return res.status(409).json({ ok: false, error: 'Site already exists at that URL' });
@@ -190,6 +181,70 @@ router.post('/:id/detect-pages', async (req, res) => {
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
   }
+});
+
+// GET /api/sites/:id/page-candidates — every page the live sitemap lists,
+// for the "which pages should we monitor?" checklist shown at registration
+// and in Settings. Read-only — does not touch Site.monitoredPages. Also
+// returns the site's currently-saved monitoredPages so the frontend can
+// pre-check whichever ones are already selected.
+router.get('/:id/page-candidates', async (req, res) => {
+  const site = await Site.findById(req.params.id).lean();
+  if (!site) return res.status(404).json({ ok: false, error: 'Not found' });
+  try {
+    const { candidates, source } = await detectSitemapCandidates(site.url);
+    res.json({ ok: true, candidates, source, monitoredPages: site.monitoredPages || [] });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// PUT /api/sites/:id/monitored-pages — save the user's page selection
+// (from the checklist above). Body: { pages: [{ label, path, enabled? }] }.
+// Multiple pages, a single page, or pages sharing a similar "kind" are all
+// fine — there's no fixed set of allowed labels, whatever the user picked
+// (or typed manually) is saved verbatim. New/changed pages start with
+// matchStatus 'unknown' until the next daily scan confirms them against the
+// sitemap (services/sitemapDetect.js's refreshPageMatchStatus).
+router.put('/:id/monitored-pages', async (req, res) => {
+  const site = await Site.findById(req.params.id);
+  if (!site) return res.status(404).json({ ok: false, error: 'Not found' });
+
+  const incoming = Array.isArray(req.body?.pages) ? req.body.pages : null;
+  if (!incoming || !incoming.length) {
+    return res.status(400).json({ ok: false, error: '"pages" must be a non-empty array of { label, path }' });
+  }
+  for (const p of incoming) {
+    if (!p || typeof p.label !== 'string' || !p.label.trim() || typeof p.path !== 'string' || !p.path.trim()) {
+      return res.status(400).json({ ok: false, error: 'Each page needs a non-empty "label" and "path"' });
+    }
+  }
+
+  // Preserve matchStatus/lastMatchedAt/lastMismatchAt for any page whose
+  // path already existed in the saved list (editing labels/enabled doesn't
+  // reset its known-good history); anything genuinely new starts 'unknown'.
+  const existingByPath = new Map((site.monitoredPages || []).map(p => [p.path, p]));
+  site.monitoredPages = incoming.map(p => {
+    const path = p.path.trim().startsWith('/') ? p.path.trim() : `/${p.path.trim()}`;
+    const prev = existingByPath.get(path);
+    return {
+      label: p.label.trim(),
+      path,
+      enabled: p.enabled !== false,
+      matchStatus: prev?.matchStatus || 'unknown',
+      lastMatchedAt: prev?.lastMatchedAt || null,
+      lastMismatchAt: prev?.lastMismatchAt || null,
+    };
+  });
+  site.markModified('monitoredPages');
+  // This is the ONLY place that flips pagesConfigured to true — an explicit
+  // user save of their page selection. See models/Site.js for why this
+  // gate exists (screenshot/PageSpeed capture skip any site where it's
+  // still false, rather than running against un-reviewed guessed slugs).
+  site.pagesConfigured = true;
+  await site.save();
+
+  res.json({ ok: true, monitoredPages: site.monitoredPages, pagesConfigured: true });
 });
 
 // GET /api/sites/:id — single site

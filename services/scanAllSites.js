@@ -4,7 +4,7 @@ import Snapshot from '../models/Snapshot.js';
 import { deriveHealthStatus } from './healthStatus.js';
 import { syncAlertsForSite } from '../routes/alerts.js';
 import { sendAlertEmail } from './email.js';
-import { detectMonitoredPages } from './sitemapDetect.js';
+import { refreshPageMatchStatus } from './sitemapDetect.js';
 
 // Same connector-call helper as routes/sites.js (kept local — small enough
 // not to be worth its own shared module).
@@ -109,21 +109,29 @@ export async function scanAllSites() {
         await newHighAlertEmail(freshSite, alertDoc).catch(e => console.error('[scan] high-alert email failed:', e.message));
       }
 
-      // Best-effort: re-scan the sitemap so monitoredPages (Shop/Contact Us/
-      // Track Order) stay accurate even if the site's permalinks/slugs
-      // change after registration. Runs on every daily scan for online
-      // sites only — never blocks the scan if the site has no sitemap or
-      // detection fails, and screenshots/PageSpeed keep using the last
-      // known-good pages either way.
-      if (!wentOffline && snap?.ok) {
+      // Re-check the user's SAVED monitored pages against a fresh sitemap
+      // scan, updating each page's matchStatus (ok/mismatch) in place — this
+      // does NOT replace the page list itself (that would silently discard
+      // the user's own selection, which is exactly the bug this replaced;
+      // see services/sitemapDetect.js's refreshPageMatchStatus for the full
+      // reasoning). Only runs for sites where the user has actually
+      // configured pages (pagesConfigured) — skipping this for
+      // unconfigured sites avoids generating "mismatch" noise for pages
+      // nobody asked to monitor yet. Never blocks the scan if the sitemap
+      // is unreachable; screenshots/PageSpeed just keep using the last
+      // known matchStatus either way.
+      if (!wentOffline && snap?.ok && freshSite.pagesConfigured) {
         try {
-          const { pages, source } = await detectMonitoredPages(freshSite.url);
-          await Site.findByIdAndUpdate(freshSite._id, {
-            $set: { monitoredPages: pages },
-          });
-          console.log(`[scan] ${freshSite.url}: monitoredPages refreshed via ${source}`);
+          const { pages, scanOk } = await refreshPageMatchStatus(freshSite);
+          if (scanOk) {
+            await Site.findByIdAndUpdate(freshSite._id, { $set: { monitoredPages: pages } });
+            const mismatched = pages.filter(p => p.matchStatus === 'mismatch');
+            if (mismatched.length) {
+              console.log(`[scan] ${freshSite.url}: ${mismatched.length} page(s) no longer match the sitemap: ${mismatched.map(p => p.label).join(', ')}`);
+            }
+          }
         } catch (e) {
-          console.log(`[scan] ${freshSite.url}: sitemap re-detection failed — ${e.message}`);
+          console.log(`[scan] ${freshSite.url}: page match-status refresh failed — ${e.message}`);
         }
       }
     } catch (e) {

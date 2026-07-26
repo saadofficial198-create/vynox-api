@@ -82,6 +82,77 @@ async function getAllSitemapUrls(baseUrl) {
 }
 
 /**
+ * Fetches every published Page via WordPress's own core REST API
+ * (/wp-json/wp/v2/pages) — available by default on every WordPress install,
+ * no plugin/config needed, and NOT dependent on a sitemap existing at all.
+ * This is now tried FIRST (see detectSitemapCandidates below): bolocart.com's
+ * sitemap genuinely 404s (confirmed in a real browser, not just blocked), so
+ * relying on it alone leaves the page picker with only "Home". The REST API
+ * bypasses that entirely since it reads straight from the WP database.
+ *
+ * Caveat (accepted tradeoff, per user's explicit choice of this approach):
+ * this only returns the "page" post type. A WooCommerce "Shop" page is a
+ * normal WP Page so it appears here fine; something implemented purely as a
+ * shortcode on a non-"page" post type, or a page explicitly excluded from
+ * the REST API by a security plugin, would not show up. That's fine — the
+ * sitemap fallback below still runs and merges in anything this misses.
+ *
+ * Returns null (not a thrown error) if the endpoint isn't reachable/enabled,
+ * so callers can safely fall back without special-casing exceptions.
+ */
+async function fetchPagesFromRestApi(baseUrl, { perPage = 100 } = {}) {
+  const base = cleanUrl(baseUrl);
+  try {
+    // IMPORTANT: do NOT request the full response (no `status` param, no
+    // omitting `_fields`) — confirmed live against bolocart.com that
+    // /wp/v2/pages without `_fields` returns a "critical error" (WordPress
+    // fatal), almost certainly because each page's full Elementor-built
+    // `content.rendered` HTML is enormous and rendering/serializing all of
+    // them in one list response exhausts PHP memory/time on this host.
+    // Requesting only `_fields=id,slug,link,title,parent` (no `status`
+    // param — the public REST API already only returns published pages by
+    // default for anonymous requests) confirmed working: it returns a
+    // lightweight JSON array instead of crashing.
+    const { data, status } = await axios.get(`${base}/wp-json/wp/v2/pages`, {
+      timeout: 20000,
+      validateStatus: () => true,
+      params: { per_page: perPage, _fields: 'id,slug,link,title,parent' },
+      headers: { Accept: 'application/json' },
+    });
+    if (status !== 200 || !Array.isArray(data)) return null;
+
+    const candidates = [];
+    for (const p of data) {
+      let path;
+      try {
+        path = new URL(p.link).pathname.replace(/\/$/, '') || '/';
+      } catch {
+        continue;
+      }
+      const label = (p.title?.rendered || '').trim() || labelFromPath(path);
+      candidates.push({ label: decodeHtmlEntities(label), path });
+    }
+    return candidates;
+  } catch {
+    return null;
+  }
+}
+
+/** Minimal decoder for the handful of HTML entities WP commonly puts in titles (&amp;, &#8217;, etc.). */
+function decodeHtmlEntities(str) {
+  return String(str)
+    .replace(/&amp;/g, '&')
+    .replace(/&#8217;|&rsquo;/g, "'")
+    .replace(/&#8216;|&lsquo;/g, "'")
+    .replace(/&#8220;|&ldquo;/g, '"')
+    .replace(/&#8221;|&rdquo;/g, '"')
+    .replace(/&#8211;|&ndash;/g, '-')
+    .replace(/&#8212;|&mdash;/g, '—')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;|&apos;/g, "'");
+}
+
+/**
  * Returns EVERY page the sitemap lists (deduped, capped at a sane limit),
  * as { label, path } candidates for the user to choose from at registration
  * time or later in site Settings — see routes/sites.js's /detect-pages and
@@ -97,16 +168,35 @@ async function getAllSitemapUrls(baseUrl) {
  */
 export async function detectSitemapCandidates(baseUrl, { limit = 60 } = {}) {
   const base = cleanUrl(baseUrl);
+  const seen = new Set(['/']);
+  const candidates = [{ label: 'Home', path: '/' }];
+  let source = null;
+
+  // 1) Try the WordPress core REST API first — it doesn't depend on a
+  // sitemap existing, which is what broke bolocart.com's candidate list
+  // entirely (real 404 on every sitemap URL, confirmed in-browser).
+  const restPages = await fetchPagesFromRestApi(base);
+  if (restPages && restPages.length) {
+    for (const p of restPages) {
+      if (candidates.length >= limit) break;
+      if (seen.has(p.path)) continue;
+      seen.add(p.path);
+      candidates.push(p);
+    }
+    source = 'wp-rest-api';
+  }
+
+  // 2) Also check the sitemap and merge in anything the REST API missed
+  // (e.g. non-"page" post types some sites map into their sitemap). If the
+  // REST API found nothing at all, the sitemap becomes the primary source
+  // instead of just a supplement.
   let urls = [];
   try {
     urls = await getAllSitemapUrls(base);
   } catch {
-    return { candidates: [{ label: 'Home', path: '/' }], source: 'default (sitemap fetch failed)' };
+    urls = [];
   }
-
-  const seen = new Set(['/']);
-  const candidates = [{ label: 'Home', path: '/' }];
-
+  let addedFromSitemap = 0;
   for (const u of urls) {
     if (candidates.length >= limit) break;
     let path;
@@ -118,12 +208,20 @@ export async function detectSitemapCandidates(baseUrl, { limit = 60 } = {}) {
     if (seen.has(path)) continue;
     seen.add(path);
     candidates.push({ label: labelFromPath(path), path });
+    addedFromSitemap++;
+  }
+
+  if (!source) {
+    source = urls.length ? 'sitemap' : 'default (no sitemap or REST API pages found)';
+  } else if (addedFromSitemap) {
+    source = 'wp-rest-api + sitemap';
   }
 
   if (candidates.length <= 1) {
-    return { candidates, source: urls.length ? 'sitemap (no additional pages found)' : 'default (no sitemap found)' };
+    source = 'default (no sitemap or REST API pages found)';
   }
-  return { candidates, source: 'sitemap' };
+
+  return { candidates, source };
 }
 
 /**
@@ -211,19 +309,33 @@ export async function refreshPageMatchStatus(site) {
   const pages = Array.isArray(site.monitoredPages) ? site.monitoredPages : [];
   if (!pages.length) return { pages, scanOk: true };
 
+  // Same REST-API-first approach as detectSitemapCandidates: bolocart.com's
+  // sitemap genuinely doesn't exist (404), which used to mean matchStatus
+  // could never refresh for that site (getAllSitemapUrls always empty ->
+  // scanOk: false -> "page slug changed" alerts could never clear/fire
+  // correctly). Checking the REST API first means sites without a sitemap
+  // still get real match-status tracking.
+  const restPaths = await fetchPagesFromRestApi(site.url);
   let urls = [];
   try {
     urls = await getAllSitemapUrls(site.url);
   } catch {
-    return { pages, scanOk: false }; // leave matchStatus as-is; not the pages' fault
+    urls = [];
   }
-  if (!urls.length) return { pages, scanOk: false };
 
-  const sitemapPaths = new Set(
-    urls
+  if ((!restPaths || !restPaths.length) && (!urls.length)) {
+    // Both sources came back empty/failed — genuinely couldn't scan the site
+    // right now (down, or neither mechanism available). Leave matchStatus
+    // as-is rather than falsely flagging every page as mismatched.
+    return { pages, scanOk: false };
+  }
+
+  const sitemapPaths = new Set([
+    ...(restPaths || []).map(p => p.path),
+    ...urls
       .map(u => { try { return new URL(u).pathname.replace(/\/$/, '') || '/'; } catch { return null; } })
-      .filter(Boolean)
-  );
+      .filter(Boolean),
+  ]);
 
   const now = new Date();
   const updated = pages.map(p => {

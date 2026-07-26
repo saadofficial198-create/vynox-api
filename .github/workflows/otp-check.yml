@@ -38,4 +38,10 @@ jobs:
           OTP_TEST_EMAIL_PASSWORD: ${{ secrets.OTP_TEST_EMAIL_PASSWORD }}
           OTP_IMAP_HOST: ${{ secrets.OTP_IMAP_HOST }}
           OTP_IMAP_PORT: ${{ secrets.OTP_IMAP_PORT }}
+          # Sent as the X-Vynox-Bot header on the send_otp AJAX call so a
+          # site's Imunify360 (or similar) bot-protection can allowlist this
+          # monitor by header instead of by IP (GitHub runner IPs change
+          # every run, so IP whitelisting isn't viable). Optional — if unset,
+          # the header is simply omitted.
+          OTP_MONITOR_SECRET: ${{ secrets.OTP_MONITOR_SECRET }}
         run: node scripts/runOtpCheck.js

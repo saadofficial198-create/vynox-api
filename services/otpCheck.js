@@ -32,8 +32,21 @@ import { checkForOtpEmail } from './imapCheck.js';
 // trigger the send, then confirm delivery via IMAP. No WooCommerce order is
 // created by any of this (verify_otp + a real form submit would be needed
 // for that), so there's nothing to clean up.
+//
+// Imunify360 (a bot-protection layer many cPanel hosts run in front of
+// WordPress) can flag this plain server-to-server POST as bot traffic and
+// return "Access denied by Imunify360 bot-protection" — GitHub Actions runner
+// IPs change on every run, so IP whitelisting isn't viable. Instead we send:
+//   1. A custom X-Vynox-Bot header carrying OTP_MONITOR_SECRET, which the
+//      site admin whitelists in Imunify360's "Allowlist by header" (or
+//      equivalent) rule — this works for any number of sites without ever
+//      touching an IP list.
+//   2. A normal-looking browser User-Agent, since some bot-protection rules
+//      also flag on missing/non-browser UAs.
 
 const REQUEST_TIMEOUT_MS = 20_000;
+const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 /**
  * Triggers the OTP send by calling the plugin's own AJAX endpoint directly,
@@ -73,11 +86,21 @@ export async function runOtpCheck({ ajaxUrl }) {
 
   try {
     result.triggeredAt = new Date();
+    const headers = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': BROWSER_USER_AGENT,
+    };
+    // Optional — only sent if configured. Lets a site's Imunify360 (or any
+    // similar bot-protection) allowlist this monitor by header instead of by
+    // IP, which would otherwise need updating on every GitHub Actions run.
+    if (process.env.OTP_MONITOR_SECRET) {
+      headers['X-Vynox-Bot'] = process.env.OTP_MONITOR_SECRET;
+    }
     const res = await axios.post(
       ajaxUrl,
       new URLSearchParams({ action: 'send_otp', email }).toString(),
       {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers,
         timeout: REQUEST_TIMEOUT_MS,
         validateStatus: () => true,
       }

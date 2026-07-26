@@ -37,13 +37,19 @@ const MonitoredPageSchema = new mongoose.Schema(
   { _id: false }
 );
 
-const DEFAULT_MONITORED_PAGES = [
-  { label: 'Home',            path: '/' },
-  { label: 'Shop',             path: '/shop' },
-  { label: 'Contact Us',       path: '/contact-us' },
-  { label: 'Track Your Order', path: '/track-order' },
-];
-
+// NOTE: there used to be a DEFAULT_MONITORED_PAGES constant (Home/Shop/
+// Contact Us/Track Order guessed slugs) that Mongoose auto-filled onto
+// EVERY new site via monitoredPages' schema default, even though
+// routes/sites.js explicitly stopped calling detectMonitoredPages() at
+// registration time. That meant a brand new site still silently started
+// with 4 pre-populated, pre-CHECKED entries in the page picker using
+// guessed slugs — exactly the "auto-selects a page whose slug doesn't
+// even exist" bug the user reported (e.g. "/contact-us" when the site's
+// real page is "/contact-page"). monitoredPages now defaults to a plain
+// empty array: a new site starts with NOTHING selected, and the user must
+// explicitly check pages themselves in the picker (GET /page-candidates +
+// PUT /monitored-pages) before pagesConfigured flips to true and any
+// screenshot/PageSpeed capture is allowed to run.
 const SiteSchema = new mongoose.Schema(
   {
     name:           { type: String, required: true },
@@ -57,7 +63,7 @@ const SiteSchema = new mongoose.Schema(
     tags:           { type: [String], default: [] },
     notes:          { type: String, default: '' },
     latest:         { type: mongoose.Schema.Types.Mixed, default: null },
-    monitoredPages: { type: [MonitoredPageSchema], default: () => DEFAULT_MONITORED_PAGES },
+    monitoredPages: { type: [MonitoredPageSchema], default: () => [] },
     // A new site — whether auto-registered by the plugin (POST /register)
     // or added manually — starts with pagesConfigured: false. Screenshot
     // capture and PageSpeed checks both skip any site where this is false
@@ -77,5 +83,4 @@ const SiteSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-export { DEFAULT_MONITORED_PAGES };
 export default mongoose.model('Site', SiteSchema);

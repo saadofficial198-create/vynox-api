@@ -113,8 +113,16 @@ async function fetchPagesFromRestApi(baseUrl, { perPage = 100 } = {}) {
     // param — the public REST API already only returns published pages by
     // default for anonymous requests) confirmed working: it returns a
     // lightweight JSON array instead of crashing.
+    //
+    // Timeout is intentionally generous (2 minutes): confirmed live that on
+    // a busy cPanel host (CPU near 100%), this exact endpoint can take
+    // 1-2 minutes to respond even though it eventually succeeds — the user
+    // watched the same URL take that long in a browser tab. This function
+    // is only called when a human opens the page-selection picker (not on
+    // every request), so it's fine for it to wait rather than give up early
+    // and wrongly report "no pages found" just because the site was slow.
     const { data, status } = await axios.get(`${base}/wp-json/wp/v2/pages`, {
-      timeout: 20000,
+      timeout: 120000,
       validateStatus: () => true,
       params: { per_page: perPage, _fields: 'id,slug,link,title,parent' },
       headers: { Accept: 'application/json' },

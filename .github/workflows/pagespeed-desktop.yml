@@ -1,0 +1,67 @@
+name: Daily Desktop PageSpeed scan
+
+# Triggers a Desktop-strategy Google PageSpeed check for every site (see
+# services/pagespeed.js's checkAllSitesPageSpeed('desktop') and the new
+# POST /api/scan/run-pagespeed route in routes/scan.js).
+#
+# This is separate from the "Daily security scan" workflow (daily-scan.yml)
+# on purpose — that one only syncs site health/uptime/updates data
+# (services/scanAllSites.js) and has never touched PageSpeed at all. Mixing
+# the two into one workflow would make failures harder to diagnose (a slow
+# PageSpeed run could make the health-scan step look broken, and vice
+# versa), so this stays a fully independent job.
+#
+# The backend's own cPanel process also runs an internal 6-hourly Desktop
+# PageSpeed timer (server.js's pageSpeedJob, guarded by models/JobLock.js),
+# but that timer only fires while the Node process happens to still be
+# alive at that exact moment — restarts, deploys, or crashes can silently
+# skip it for hours. This workflow gives a reliable, roughly twice-daily
+# guarantee on top of that, the same way daily-scan.yml does for site
+# health. If the internal timer already ran recently, JobLock's own 6h
+# cooldown just means this run's results simply refresh what's already
+# there — no harm in overlapping.
+#
+# Time is in UTC (Pakistan is UTC+5). Runs 2x/day, roughly aligned with the
+# site-health scan: ~12:00 AM and ~12:00 PM PKT (hence the name "12 to 12").
+#
+# NOTE: deliberately NOT on the round hour (":00") or the same minute as the
+# other 3 scheduled workflows. GitHub Actions doesn't guarantee scheduled
+# runs fire at the exact minute — round hours like 00:00/12:00 UTC get hit
+# by a huge number of repos at once, so GitHub's shared runners can queue
+# jobs for hours (observed live on this repo: a 07:00 UTC run still hadn't
+# started ~3 hours later). Offsetting to ":16" — different from otp-check's
+# ":13", screenshots' ":06", and daily-scan's ":10" — avoids all four of
+# this repo's own scheduled jobs piling onto a shared runner at the exact
+# same second, on top of avoiding the wider round-hour crowd.
+on:
+  schedule:
+    - cron: '16 19 * * *'  # ~00:16 PKT (midnight) — 19:16 UTC previous day
+    - cron: '16 7 * * *'   # ~12:16 PKT (noon)
+  workflow_dispatch: {}    # lets you trigger a run manually from the Actions tab
+
+jobs:
+  pagespeed-desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # just fires the request and confirms it started — the
+    # actual PageSpeed run happens in the BACKGROUND on the cPanel backend
+    # (POST /run-pagespeed responds 202 immediately, see routes/scan.js),
+    # so this job doesn't need to sit and wait for every site to finish.
+    steps:
+      - name: Trigger Desktop PageSpeed scan
+        env:
+          OTP_MONITOR_SECRET: ${{ secrets.OTP_MONITOR_SECRET }}
+        run: |
+          status=$(curl -s -o /tmp/response.txt -w "%{http_code}" -X POST \
+            "https://vynox.progamesgears.com/api/scan/run-pagespeed" \
+            -H "X-Scan-Secret: ${{ secrets.SCAN_TRIGGER_SECRET }}" \
+            -H "Content-Type: application/json" \
+            ${OTP_MONITOR_SECRET:+-H "X-Vynox-Bot: $OTP_MONITOR_SECRET"} \
+            -d "{}")
+          echo "Response body:"
+          cat /tmp/response.txt
+          echo ""
+          echo "HTTP status: $status"
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "PageSpeed trigger failed with status $status"
+            exit 1
+          fi

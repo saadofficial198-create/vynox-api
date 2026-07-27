@@ -39,7 +39,12 @@ router.post('/check-all', (_req, res) => {
     .finally(() => { checkAllRunning = false; });
 });
 
-// POST /api/pagespeed/:siteId/check — manually trigger a PageSpeed run for one site
+// POST /api/pagespeed/:siteId/check?strategy=mobile|desktop — manually
+// trigger a PageSpeed run for one site, for whichever strategy the dashboard
+// has toggled (default 'mobile'). Both strategies can be manually checked
+// from the Performance tab now — the 6-hourly internal scheduler
+// (server.js -> checkAllSitesPageSpeed('desktop')) still separately keeps
+// desktop scores fresh in the background even if nobody clicks the button.
 router.post('/:siteId/check', async (req, res) => {
   const site = await Site.findById(req.params.siteId);
   if (!site) return res.status(404).json({ ok: false, error: 'Site not found' });
@@ -51,29 +56,32 @@ router.post('/:siteId/check', async (req, res) => {
     return res.status(409).json({ ok: false, error: 'Monitored pages have not been configured for this site yet — set them up in Settings first.' });
   }
 
+  const strategy = (req.query.strategy === 'desktop' || req.body?.strategy === 'desktop') ? 'desktop' : 'mobile';
   const siteId = String(site._id);
-  if (runningSites.has(siteId)) {
-    return res.status(409).json({ ok: false, error: 'A check is already in progress for this site' });
+  // Keyed by siteId+strategy (not just siteId) so a Mobile check running for
+  // a site doesn't block a Desktop check for the SAME site from starting —
+  // they're independent runs against independent PageSpeedResult documents.
+  const runKey = `${siteId}:${strategy}`;
+  if (runningSites.has(runKey)) {
+    return res.status(409).json({ ok: false, error: `A ${strategy} check is already in progress for this site` });
   }
 
-  runningSites.add(siteId);
-  res.status(202).json({ ok: true, message: 'PageSpeed check started — refresh results shortly.' });
+  runningSites.add(runKey);
+  res.status(202).json({ ok: true, strategy, message: `PageSpeed check (${strategy}) started — refresh results shortly.` });
 
-  // Manual "Check Now" always checks the 'mobile' strategy — the 6-hourly
-  // scheduled job (server.js -> checkAllSitesPageSpeed) covers 'desktop'.
-  // This split means both strategies stay fresh without doubling API quota
-  // on every manual click.
-  checkSitePageSpeed(site, 'mobile')
-    .then((results) => console.log(`[pagespeed] ${site.name || siteId} check complete: ${results.length} page(s)`))
-    .catch((e) => console.error(`[pagespeed] ${site.name || siteId} check failed:`, e.message))
-    .finally(() => { runningSites.delete(siteId); });
+  checkSitePageSpeed(site, strategy)
+    .then((results) => console.log(`[pagespeed] ${site.name || siteId} (${strategy}) check complete: ${results.length} page(s)`))
+    .catch((e) => console.error(`[pagespeed] ${site.name || siteId} (${strategy}) check failed:`, e.message))
+    .finally(() => { runningSites.delete(runKey); });
 });
 
-// GET /api/pagespeed/:siteId/status — whether a background check is currently
-// running for this site, so the frontend can restore "Checking…" UI after a
-// page reload (it otherwise has no way to know the in-memory state above).
+// GET /api/pagespeed/:siteId/status?strategy=mobile|desktop — whether a
+// background check is currently running for this site+strategy, so the
+// frontend can restore "Checking…" UI after a page reload (it otherwise has
+// no way to know the in-memory state above).
 router.get('/:siteId/status', (req, res) => {
-  res.json({ ok: true, checking: runningSites.has(String(req.params.siteId)) });
+  const strategy = req.query.strategy === 'desktop' ? 'desktop' : 'mobile';
+  res.json({ ok: true, checking: runningSites.has(`${req.params.siteId}:${strategy}`) });
 });
 
 // GET /api/pagespeed/:siteId/latest?strategy=mobile|desktop — latest result

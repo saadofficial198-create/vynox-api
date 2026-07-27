@@ -8,11 +8,19 @@ name: OTP email delivery check
 # services/otpLayers.js, services/imapCheck.js, scripts/runOtpCheck.js.
 #
 # Times are in UTC. Aligned with the daily-scan and screenshot schedules:
-# 2x/day, 12:00 AM and 12:00 PM PKT.
+# roughly 12:00 AM and 12:00 PM PKT.
+#
+# NOTE: deliberately NOT on the round hour (":00"). GitHub Actions doesn't
+# guarantee scheduled runs fire at the exact minute — a huge number of repos
+# schedule jobs at round hours like 00:00/12:00 UTC, so GitHub's shared
+# runners get a burst of demand right then and queued jobs can be delayed by
+# hours (observed live: a 07:00 UTC run hadn't started by 09:53 UTC — nearly
+# 3 hours late). Offsetting to an odd minute (":13" here) avoids that crowd
+# and keeps the actual delay much closer to GitHub's normal few-minutes lag.
 on:
   schedule:
-    - cron: '0 19 * * *'  # 00:00 PKT (midnight) — 19:00 UTC previous day
-    - cron: '0 7 * * *'   # 12:00 PKT (noon)
+    - cron: '13 19 * * *'  # ~00:13 PKT — 19:13 UTC previous day
+    - cron: '13 7 * * *'   # ~12:13 PKT
   workflow_dispatch: {}    # lets you trigger a run manually from the Actions tab
 
 jobs:

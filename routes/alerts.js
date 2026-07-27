@@ -122,6 +122,22 @@ function deriveAlerts(site, snap) {
     });
   }
 
+  // Imunify360 allowlist tracking — auto-set to 'blocked' by
+  // scripts/runOtpCheck.js when an OTP check's send_otp AJAX call is
+  // rejected by this site's own hosting server's bot-protection firewall.
+  // This is a per-server setting (see models/Site.js), so every site needs
+  // its own cPanel visit to fix — surfacing it as an alert makes it visible
+  // without digging through GitHub Actions logs.
+  if (site.imunify360Status === 'blocked') {
+    push(
+      'imunify360-blocked',
+      'OTP Monitoring Blocked by Imunify360',
+      'This site\'s hosting server is blocking our automated OTP delivery check as bot traffic. Add the X-Vynox-Bot header allowlist rule in this site\'s own cPanel > Imunify360 > WAF (see Imunify360_Allowlist_Guide.md), then mark it resolved in Settings.',
+      'Configuration',
+      'medium'
+    );
+  }
+
   return out;
 }
 

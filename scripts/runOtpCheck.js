@@ -51,6 +51,15 @@ function computeOverallStatus({ otpPluginActive, smtpPluginActive, smtpConfigure
   return 'pass';
 }
 
+// Detects the specific Imunify360 "Access denied" message inside a Layer 3
+// popupError string, so we can auto-flag Site.imunify360Status = 'blocked'.
+// This is a per-server setting (see models/Site.js's comment on
+// imunify360Status) — every site's hosting server has its own independent
+// Imunify360/firewall, so this must be tracked per-site, not globally.
+function isImunify360Block(errorMessage) {
+  return typeof errorMessage === 'string' && /imunify360/i.test(errorMessage);
+}
+
 async function checkOneSite(site) {
   console.log(`\n[runOtpCheck] --- ${site.name || site.url} (${site._id}) ---`);
 
@@ -112,6 +121,25 @@ async function checkOneSite(site) {
   console.log(`[runOtpCheck] overallStatus: ${record.overallStatus}`);
 
   await OtpCheck.create(record);
+
+  // Auto-flag Site.imunify360Status = 'blocked' whenever this specific
+  // failure shows up, so the dashboard can surface "this site's server
+  // needs the X-Vynox-Bot allowlist rule" without the user having to dig
+  // through workflow logs — see models/Site.js's comment on
+  // imunify360Status for the full reasoning (this is a manual/tracked
+  // status, not something we can fix remotely, since every hosting
+  // server's Imunify360 is independent and usually has no client-facing
+  // API). We only ever set it to 'blocked' automatically — moving it to
+  // 'allowlisted' is always a manual user action (PUT
+  // /:id/imunify360-status), since we can't verify the fix ourselves
+  // until the next check happens to succeed.
+  if (isImunify360Block(record.popupError) && site.imunify360Status !== 'blocked') {
+    await Site.findByIdAndUpdate(site._id, {
+      $set: { imunify360Status: 'blocked', imunify360CheckedAt: new Date() },
+    }).catch((e) => console.error('[runOtpCheck] failed to update imunify360Status:', e.message));
+    console.log('[runOtpCheck] detected Imunify360 block — marked Site.imunify360Status = "blocked"');
+  }
+
   return record.overallStatus;
 }
 

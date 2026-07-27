@@ -79,6 +79,35 @@ const SiteSchema = new mongoose.Schema(
     // PUT /:id/monitored-pages (the user explicitly saving their page
     // selection in Settings) is the ONLY thing that sets this to true.
     pagesConfigured: { type: Boolean, default: false },
+
+    // Tracks whether THIS site's hosting server has allowlisted our
+    // X-Vynox-Bot header in its Imunify360 (or similar) bot-protection
+    // firewall — see services/otpCheck.js and the Imunify360 allowlist
+    // guide doc. This is a SERVER-level setting, not something our code can
+    // configure remotely (Imunify360 has no public API most hosts expose to
+    // clients, and even if it did, we'd need WHM/root access per server,
+    // which shared-hosting clients usually don't have) — so this is a
+    // tracked/manual status, not an automated one:
+    //   - 'unknown'  — default for every new site; we haven't seen evidence
+    //                  either way yet (no OTP check has run, or it hasn't
+    //                  hit this specific failure)
+    //   - 'blocked'  — auto-set by services/otpCheck.js whenever an OTP
+    //                  check's Layer 3 result contains the Imunify360
+    //                  "Access denied" message. This means the user needs
+    //                  to go into THIS site's own cPanel and add the
+    //                  allowlist rule (see the guide doc) — every server is
+    //                  independent, so having done this for one site's
+    //                  server does NOT fix another site on a different
+    //                  server.
+    //   - 'allowlisted' — set ONLY by the user manually confirming (via
+    //                  PUT /:id/imunify360-status) after they've actually
+    //                  gone and added the rule in that site's cPanel. We
+    //                  can't verify this ourselves without waiting for the
+    //                  next OTP check to succeed, so this is an honesty-based
+    //                  manual flag, not a verified fact — the next
+    //                  successful/failed OTP check is the real proof.
+    imunify360Status: { type: String, enum: ['unknown', 'blocked', 'allowlisted'], default: 'unknown' },
+    imunify360CheckedAt: { type: Date, default: null }, // when the status last changed
   },
   { timestamps: true }
 );

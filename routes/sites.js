@@ -2,6 +2,10 @@ import express from 'express';
 import axios from 'axios';
 import Site from '../models/Site.js';
 import Snapshot from '../models/Snapshot.js';
+import Screenshot from '../models/Screenshot.js';
+import PageSpeedResult from '../models/PageSpeedResult.js';
+import OtpCheck from '../models/OtpCheck.js';
+import Alert from '../models/Alert.js';
 import { detectMonitoredPages, detectSitemapCandidates } from '../services/sitemapDetect.js';
 import { deriveHealthStatus } from '../services/healthStatus.js';
 
@@ -247,6 +251,36 @@ router.put('/:id/monitored-pages', async (req, res) => {
   res.json({ ok: true, monitoredPages: site.monitoredPages, pagesConfigured: true });
 });
 
+// PUT /api/sites/:id/imunify360-status — manually set this site's
+// Imunify360-allowlist tracking status. Body: { status: 'allowlisted' | 'unknown' }.
+//
+// This exists because Imunify360 is a per-server firewall with no
+// client-facing API most hosts expose (and even if it did, automating it
+// would need WHM/root-level access per server, which shared-hosting
+// accounts usually don't have) — see models/Site.js's comment on
+// imunify360Status, and the Imunify360_Allowlist_Guide.md doc. So the flow
+// is: scripts/runOtpCheck.js auto-detects and sets 'blocked' when an OTP
+// check hits the Imunify360 error; the user then manually goes into THAT
+// site's own cPanel, adds the allowlist rule, and calls this endpoint to
+// record that they did it. We deliberately do NOT allow setting 'blocked'
+// here — only the auto-detector should ever mark a site as blocked, since
+// that's based on real evidence (an actual failed request), not a guess.
+router.put('/:id/imunify360-status', async (req, res) => {
+  const site = await Site.findById(req.params.id);
+  if (!site) return res.status(404).json({ ok: false, error: 'Not found' });
+
+  const { status } = req.body || {};
+  if (!['allowlisted', 'unknown'].includes(status)) {
+    return res.status(400).json({ ok: false, error: '"status" must be "allowlisted" or "unknown"' });
+  }
+
+  site.imunify360Status = status;
+  site.imunify360CheckedAt = new Date();
+  await site.save();
+
+  res.json({ ok: true, imunify360Status: site.imunify360Status });
+});
+
 // GET /api/sites/:id — single site
 router.get('/:id', async (req, res) => {
   const site = await Site.findById(req.params.id).lean();
@@ -254,11 +288,28 @@ router.get('/:id', async (req, res) => {
   res.json({ ok: true, site });
 });
 
-// DELETE /api/sites/:id
+// DELETE /api/sites/:id — removes the site AND every collection that
+// references it (Snapshot, Screenshot records, PageSpeedResult, OtpCheck,
+// Alert). Previously this only deleted Snapshot, leaving the other four
+// collections' rows orphaned (still in the DB, pointing at a site._id that
+// no longer exists) — harmless in practice since a re-added site gets a
+// brand new _id and nothing queries across sites by URL, but still stale
+// data with no cleanup path. Deleting all of it here means "delete a site"
+// actually means delete ALL of its data, matching user expectation.
+// NOTE: this does NOT delete the actual screenshot image files sitting on
+// the FTP/public_html storage — those aren't tracked by an ID we can issue
+// a delete-by-id call against from here, so removing the image files
+// themselves still has to be done manually (as already done for BoloCart).
 router.delete('/:id', async (req, res) => {
   const site = await Site.findByIdAndDelete(req.params.id);
   if (!site) return res.status(404).json({ ok: false, error: 'Not found' });
-  await Snapshot.deleteMany({ site: site._id });
+  await Promise.all([
+    Snapshot.deleteMany({ site: site._id }),
+    Screenshot.deleteMany({ site: site._id }),
+    PageSpeedResult.deleteMany({ site: site._id }),
+    OtpCheck.deleteMany({ site: site._id }),
+    Alert.deleteMany({ site: site._id }),
+  ]);
   res.json({ ok: true });
 });
 

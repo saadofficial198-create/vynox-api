@@ -164,7 +164,11 @@ async function pageSpeedJob() {
   }
 
   try {
-    const summary = await checkAllSitesPageSpeed();
+    // Explicitly 'desktop' — this is the scheduled/automatic job. The
+    // 'mobile' strategy is only refreshed by the manual "Check Now" button
+    // (routes/pagespeed.js's /:siteId/check), so both strategies stay
+    // populated without doubling PageSpeed API calls on every scheduled tick.
+    const summary = await checkAllSitesPageSpeed('desktop');
     console.log('[pagespeed] run complete:', JSON.stringify(summary));
   } catch (e) {
     console.error('[pagespeed] run failed:', e.message);

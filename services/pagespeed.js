@@ -76,10 +76,24 @@ const RETRY_DELAY_MS = 20000; // 20s between attempts (raised from 8s) — gives
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// Some PageSpeed/Lighthouse failures are just the TARGET site's own server
+// being slow/overloaded at that exact moment (not a real problem with the
+// page) — FAILED_DOCUMENT_REQUEST and generic timeouts are the classic case
+// (confirmed live on bolocart.com when its cPanel CPU was pegged at 100%).
+// For these specific errors we wait longer than the normal retry delay
+// before trying again, giving the site's server more time to recover.
+const SLOW_SERVER_ERROR_PATTERN = /FAILED_DOCUMENT_REQUEST|ERR_TIMED_OUT|ERR_CONNECTION|timeout of \d+ms exceeded|NO_FCP/i;
+const SLOW_SERVER_RETRY_DELAY_MS = 45000; // 45s — longer than the normal 20s
+
+function isSlowServerError(e) {
+  const msg = e.response?.data?.error?.message || e.message || '';
+  return SLOW_SERVER_ERROR_PATTERN.test(msg);
+}
+
 /**
- * Runs PageSpeed checks for every monitoredPage of a single site (mobile
- * strategy only, to keep API usage low — desktop can be added later if needed),
- * saves one PageSpeedResult per page, and returns the array of saved docs.
+ * Runs PageSpeed checks for every monitoredPage of a single site for ONE
+ * strategy ('mobile' or 'desktop'), saves one PageSpeedResult per page, and
+ * returns the array of saved docs.
  *
  * Skips any page that's disabled (page.enabled === false) or currently
  * mismatched against the sitemap (page.matchStatus === 'mismatch' — see
@@ -90,7 +104,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
  * a misleading score for the WRONG page if the slug now happens to resolve
  * to something else entirely.
  */
-export async function checkSitePageSpeed(site) {
+export async function checkSitePageSpeed(site, strategy = 'mobile') {
   const allPages = site.monitoredPages?.length ? site.monitoredPages : [{ label: 'Home', path: '/' }];
   const pages = allPages.filter(p => p.enabled !== false && p.matchStatus !== 'mismatch');
   const results = [];
@@ -101,13 +115,13 @@ export async function checkSitePageSpeed(site) {
 
     for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
       try {
-        const { scores, vitals, raw } = await fetchPageSpeed(fullUrl, 'mobile');
+        const { scores, vitals, raw } = await fetchPageSpeed(fullUrl, strategy);
         const doc = await PageSpeedResult.create({
           site: site._id,
           pageLabel: page.label,
           pagePath: page.path,
           fullUrl,
-          strategy: 'mobile',
+          strategy,
           ok: true,
           scores,
           vitals,
@@ -119,20 +133,26 @@ export async function checkSitePageSpeed(site) {
       } catch (e) {
         lastError = e;
         const isLastAttempt = attempt === RETRY_ATTEMPTS;
-        console.log(`[pagespeed] ${fullUrl} attempt ${attempt}/${RETRY_ATTEMPTS} failed: ${e.response?.data?.error?.message || e.message}${isLastAttempt ? '' : ' — retrying...'}`);
-        if (!isLastAttempt) await sleep(RETRY_DELAY_MS);
+        const slowServer = isSlowServerError(e);
+        const delay = slowServer ? SLOW_SERVER_RETRY_DELAY_MS : RETRY_DELAY_MS;
+        console.log(`[pagespeed] ${fullUrl} (${strategy}) attempt ${attempt}/${RETRY_ATTEMPTS} failed: ${e.response?.data?.error?.message || e.message}${isLastAttempt ? '' : ` — retrying in ${delay / 1000}s${slowServer ? ' (slow-server error, extra delay)' : ''}...`}`);
+        if (!isLastAttempt) await sleep(delay);
       }
     }
 
     if (lastError) {
+      const rawMsg = lastError.response?.data?.error?.message || lastError.message;
+      const friendlyMsg = isSlowServerError(lastError)
+        ? `${rawMsg} — the site's own server was too slow/overloaded to respond in time for all ${RETRY_ATTEMPTS} attempts. This is not a code problem here; it will usually succeed once the site's server isn't under heavy load.`
+        : rawMsg;
       const doc = await PageSpeedResult.create({
         site: site._id,
         pageLabel: page.label,
         pagePath: page.path,
         fullUrl,
-        strategy: 'mobile',
+        strategy,
         ok: false,
-        error: lastError.response?.data?.error?.message || lastError.message,
+        error: friendlyMsg,
       });
       results.push(doc);
     }
@@ -145,6 +165,13 @@ export async function checkSitePageSpeed(site) {
  * on purpose — Google's free tier is generous but we don't need to hammer it,
  * and running sites in parallel makes error messages harder to read in logs).
  *
+ * Strategy defaults to 'desktop' here because this is the SCHEDULED/automatic
+ * job (cron, every 6h) — the 'mobile' strategy is reserved for the manual
+ * "Check Now" button in the dashboard (see routes/pagespeed.js's /:siteId/check),
+ * so both strategies get real data without doubling API quota on every
+ * scheduled run: scheduled runs always check desktop, and mobile only gets
+ * refreshed when a user actually asks for it.
+ *
  * Sites where pagesConfigured is still false are skipped entirely — same
  * reasoning as services/screenshot.js's captureAllSites: a site the plugin
  * just auto-registered hasn't had its page selection reviewed yet, so there's
@@ -155,7 +182,7 @@ export async function checkSitePageSpeed(site) {
  * and recorded in the summary — it never stops the loop for the rest of the
  * sites.
  */
-export async function checkAllSitesPageSpeed() {
+export async function checkAllSitesPageSpeed(strategy = 'desktop') {
   const sites = await Site.find().lean(false); // full docs, need monitoredPages
   const summary = [];
   for (const site of sites) {
@@ -164,7 +191,7 @@ export async function checkAllSitesPageSpeed() {
       continue;
     }
     try {
-      const results = await checkSitePageSpeed(site);
+      const results = await checkSitePageSpeed(site, strategy);
       summary.push({ site: site.name, ok: true, pages: results.length });
     } catch (e) {
       summary.push({ site: site.name, ok: false, error: e.message });

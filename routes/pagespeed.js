@@ -59,7 +59,11 @@ router.post('/:siteId/check', async (req, res) => {
   runningSites.add(siteId);
   res.status(202).json({ ok: true, message: 'PageSpeed check started — refresh results shortly.' });
 
-  checkSitePageSpeed(site)
+  // Manual "Check Now" always checks the 'mobile' strategy — the 6-hourly
+  // scheduled job (server.js -> checkAllSitesPageSpeed) covers 'desktop'.
+  // This split means both strategies stay fresh without doubling API quota
+  // on every manual click.
+  checkSitePageSpeed(site, 'mobile')
     .then((results) => console.log(`[pagespeed] ${site.name || siteId} check complete: ${results.length} page(s)`))
     .catch((e) => console.error(`[pagespeed] ${site.name || siteId} check failed:`, e.message))
     .finally(() => { runningSites.delete(siteId); });
@@ -72,19 +76,23 @@ router.get('/:siteId/status', (req, res) => {
   res.json({ ok: true, checking: runningSites.has(String(req.params.siteId)) });
 });
 
-// GET /api/pagespeed/:siteId/latest — latest result per monitored page.
-// Includes disabled/mismatched pages too (with their matchStatus/enabled
-// flags) rather than hiding them, so the frontend can show *why* a page has
-// no fresh score ("skipped — page disabled" / "skipped — slug mismatch")
-// instead of it just silently not being there.
+// GET /api/pagespeed/:siteId/latest?strategy=mobile|desktop — latest result
+// per monitored page, for ONE strategy (default 'mobile' for backward
+// compatibility with the frontend/older callers). Includes disabled/
+// mismatched pages too (with their matchStatus/enabled flags) rather than
+// hiding them, so the frontend can show *why* a page has no fresh score
+// ("skipped — page disabled" / "skipped — slug mismatch") instead of it
+// just silently not being there.
 router.get('/:siteId/latest', async (req, res) => {
   const site = await Site.findById(req.params.siteId).lean();
   if (!site) return res.status(404).json({ ok: false, error: 'Site not found' });
 
+  const strategy = req.query.strategy === 'desktop' ? 'desktop' : 'mobile';
+
   const pages = site.monitoredPages?.length ? site.monitoredPages : [{ label: 'Home', path: '/' }];
   const latestByPage = [];
   for (const page of pages) {
-    const latest = await PageSpeedResult.findOne({ site: site._id, pageLabel: page.label })
+    const latest = await PageSpeedResult.findOne({ site: site._id, pageLabel: page.label, strategy })
       .sort({ checkedAt: -1 })
       .lean();
     latestByPage.push({
@@ -95,16 +103,17 @@ router.get('/:siteId/latest', async (req, res) => {
       latest: latest || null,
     });
   }
-  res.json({ ok: true, pages: latestByPage, pagesConfigured: !!site.pagesConfigured });
+  res.json({ ok: true, strategy, pages: latestByPage, pagesConfigured: !!site.pagesConfigured });
 });
 
-// GET /api/pagespeed/:siteId/history?page=Home&days=30 — score history for charting
+// GET /api/pagespeed/:siteId/history?page=Home&days=30&strategy=mobile|desktop — score history for charting
 router.get('/:siteId/history', async (req, res) => {
   const { page } = req.query;
   const days = Math.min(parseInt(req.query.days || '30', 10), 180);
   const since = new Date(Date.now() - days * 86400000);
+  const strategy = req.query.strategy === 'desktop' ? 'desktop' : 'mobile';
 
-  const filter = { site: req.params.siteId, checkedAt: { $gte: since }, ok: true };
+  const filter = { site: req.params.siteId, checkedAt: { $gte: since }, ok: true, strategy };
   if (page) filter.pageLabel = page;
 
   const results = await PageSpeedResult.find(filter)
@@ -112,7 +121,7 @@ router.get('/:siteId/history', async (req, res) => {
     .select('pageLabel checkedAt scores vitals')
     .lean();
 
-  res.json({ ok: true, points: results });
+  res.json({ ok: true, strategy, points: results });
 });
 
 export default router;

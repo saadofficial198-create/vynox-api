@@ -48,6 +48,68 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+// Some sites' send_otp calls fail for reasons that have nothing to do with
+// Imunify360 or our code — e.g. VIZKART's own plugin (woocommerce-email-otp.php)
+// calls wp_mail() and reports "Email sending failed." whenever THAT single
+// call to wp_mail() returns false, which cPanel's own SMTP ("Other SMTP" in
+// WP Mail SMTP) can do transiently (a brief per-hour send-rate limit, or a
+// slow/timed-out local SMTP handshake) even though the site's mail sending
+// works fine most of the time — confirmed live: a manual checkout in a real
+// browser at the same time delivered the OTP email successfully. Retrying
+// once after a short delay avoids marking the whole check "failed" over a
+// one-off hiccup on the SITE's end, the same way services/pagespeed.js
+// already retries transient Lighthouse/PageSpeed failures.
+//
+// Imunify360 blocks are NOT retried here — see isImunify360Block below —
+// because that's a different, non-transient failure (a firewall rule that
+// won't fix itself moments later); retrying it would just waste time and
+// still fail, so it's reported immediately instead.
+const SEND_OTP_RETRY_DELAY_MS = 25_000;
+
+function isImunify360Block(errorMessage) {
+  return typeof errorMessage === 'string' && /imunify360/i.test(errorMessage);
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/**
+ * One attempt at calling the plugin's send_otp AJAX endpoint. Returns
+ * { ok, triggeredAt, popupError } — never throws (network errors are
+ * captured into popupError, same as before).
+ */
+async function attemptSendOtp(ajaxUrl, email) {
+  const triggeredAt = new Date();
+  try {
+    const headers = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': BROWSER_USER_AGENT,
+    };
+    // Optional — only sent if configured. Lets a site's Imunify360 (or any
+    // similar bot-protection) allowlist this monitor by header instead of by
+    // IP, which would otherwise need updating on every GitHub Actions run.
+    if (process.env.OTP_MONITOR_SECRET) {
+      headers['X-Vynox-Bot'] = process.env.OTP_MONITOR_SECRET;
+    }
+    const res = await axios.post(
+      ajaxUrl,
+      new URLSearchParams({ action: 'send_otp', email }).toString(),
+      {
+        headers,
+        timeout: REQUEST_TIMEOUT_MS,
+        validateStatus: () => true,
+      }
+    );
+
+    const ok = res.status === 200 && res.data && res.data.success === true;
+    if (ok) return { ok: true, triggeredAt, popupError: null };
+
+    const serverMsg = res.data?.data?.message || JSON.stringify(res.data);
+    return { ok: false, triggeredAt, popupError: `send_otp AJAX call did not report success (HTTP ${res.status}): ${serverMsg}` };
+  } catch (e) {
+    return { ok: false, triggeredAt, popupError: `send_otp AJAX call failed: ${e.message}` };
+  }
+}
+
 /**
  * Triggers the OTP send by calling the plugin's own AJAX endpoint directly,
  * then verifies the email actually arrived via IMAP.
@@ -84,40 +146,21 @@ export async function runOtpCheck({ ajaxUrl }) {
     otpCode: null,
   };
 
-  try {
-    result.triggeredAt = new Date();
-    const headers = {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': BROWSER_USER_AGENT,
-    };
-    // Optional — only sent if configured. Lets a site's Imunify360 (or any
-    // similar bot-protection) allowlist this monitor by header instead of by
-    // IP, which would otherwise need updating on every GitHub Actions run.
-    if (process.env.OTP_MONITOR_SECRET) {
-      headers['X-Vynox-Bot'] = process.env.OTP_MONITOR_SECRET;
-    }
-    const res = await axios.post(
-      ajaxUrl,
-      new URLSearchParams({ action: 'send_otp', email }).toString(),
-      {
-        headers,
-        timeout: REQUEST_TIMEOUT_MS,
-        validateStatus: () => true,
-      }
-    );
+  let attempt = await attemptSendOtp(ajaxUrl, email);
 
-    const ok = res.status === 200 && res.data && res.data.success === true;
-    if (ok) {
-      result.popupAppeared = true;
-    } else {
-      result.popupAppeared = false;
-      const serverMsg = res.data?.data?.message || JSON.stringify(res.data);
-      result.popupError = `send_otp AJAX call did not report success (HTTP ${res.status}): ${serverMsg}`;
-    }
-  } catch (e) {
-    result.popupAppeared = false;
-    result.popupError = `send_otp AJAX call failed: ${e.message}`;
+  // Retry once for failures that look like a transient hiccup on the
+  // SITE's own end (e.g. its wp_mail() call briefly failing) rather than a
+  // hard block. Imunify360 blocks skip the retry entirely — see the
+  // reasoning above SEND_OTP_RETRY_DELAY_MS.
+  if (!attempt.ok && !isImunify360Block(attempt.popupError)) {
+    console.log(`[otpCheck] send_otp failed on first attempt (${attempt.popupError}) — retrying once in ${SEND_OTP_RETRY_DELAY_MS / 1000}s...`);
+    await sleep(SEND_OTP_RETRY_DELAY_MS);
+    attempt = await attemptSendOtp(ajaxUrl, email);
   }
+
+  result.triggeredAt = attempt.triggeredAt;
+  result.popupAppeared = attempt.ok;
+  result.popupError = attempt.popupError;
 
   if (!result.popupAppeared) {
     // Layer 3 "checkout_trigger_failed" — don't bother polling IMAP.

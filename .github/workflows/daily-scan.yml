@@ -1,7 +1,7 @@
 name: Daily security scan
 
-# Triggers the backend's daily site sync (pull /wp-json/vynox/v1/data for
-# every site, store a Snapshot, update Site.latest health status, sync the
+# Triggers the backend's site sync (pull /wp-json/vynox/v1/data for every
+# site, store a Snapshot, update Site.latest health status, sync the
 # persisted Alert collection, and send email notifications for newly-offline
 # sites / new high-severity alerts — see services/scanAllSites.js).
 #
@@ -12,8 +12,15 @@ name: Daily security scan
 # protected HTTP endpoint. This job is much simpler though — no Node/
 # Playwright setup, just a single curl call.
 #
-# Time is in UTC (Pakistan is UTC+5). Runs 2x/day, roughly aligned with the
-# screenshot capture schedule: ~12:00 AM and ~12:00 PM PKT.
+# Runs every hour, on the ":10" minute (UTC). This is just a lightweight
+# pull of each site's own /data endpoint (WordPress health/uptime/updates/
+# malware info our own plugin already exposes) — it doesn't touch any
+# external quota-limited API (unlike PageSpeed, which stays on its own
+# twice-daily schedule in pagespeed-desktop.yml because Google's PageSpeed
+# API is a shared, rate-limited resource). Running this hourly instead of
+# 2x/day just means Site.status/health and the Alerts list stay fresher,
+# with no real cost — routes/scan.js's `running` flag only guards against
+# two runs overlapping, there's no cooldown/quota gate to raise here.
 #
 # NOTE: deliberately NOT on the round hour (":00"). GitHub Actions doesn't
 # guarantee scheduled runs fire at the exact minute — round hours like
@@ -32,8 +39,7 @@ name: Daily security scan
 # the same way, without needing a second secret/rule.
 on:
   schedule:
-    - cron: '10 19 * * *'  # ~00:10 PKT (midnight) — 19:10 UTC previous day
-    - cron: '10 7 * * *'   # ~12:10 PKT (noon)
+    - cron: '10 * * * *'  # every hour at :10 past the hour (UTC)
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 jobs:

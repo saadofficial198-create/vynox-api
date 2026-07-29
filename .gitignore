@@ -3,6 +3,7 @@
 .env
 .env.*
 !.env.example
+README.md
 
 # Dependencies — reinstalled via package.json, no need to version them
 node_modules/

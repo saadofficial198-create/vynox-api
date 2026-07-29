@@ -35,6 +35,15 @@ const IMAGE_SETTLE_TIMEOUT_MS = Number(process.env.SCREENSHOT_IMAGE_SETTLE_TIMEO
 // How long to poll for an overlay/popup to actually disappear after we try
 // to close/hide it, before moving on regardless.
 const OVERLAY_SETTLE_TIMEOUT_MS = Number(process.env.SCREENSHOT_OVERLAY_SETTLE_TIMEOUT_MS || 8000);
+// How long to wait for a bot-verification/security-challenge interstitial
+// (Cloudflare "Just a moment...", Imunify360 "Please wait while your request
+// is being verified...", generic JS challenge pages) to clear on its own
+// before giving up. Many of these ARE designed to auto-resolve in a few
+// seconds for a real browser (Playwright's Chromium looks like one), so it's
+// worth polling for real instead of immediately treating it as a hard fail —
+// but if it's a genuine permanent block (server firewall denying our IP/UA
+// outright), it will never clear and we need to stop waiting and flag it.
+const CHALLENGE_CLEAR_TIMEOUT_MS = Number(process.env.SCREENSHOT_CHALLENGE_CLEAR_TIMEOUT_MS || 20000);
 
 function joinUrl(base, p) {
   const b = String(base || '').trim().replace(/\/$/, '');
@@ -274,9 +283,77 @@ async function dismissOverlays(tab) {
 }
 
 /**
+ * Detects whether the CURRENT page is a bot-verification / security-
+ * challenge interstitial instead of the site's real content — e.g.
+ * Cloudflare's "Checking your browser before accessing..." / "Just a
+ * moment...", Imunify360's "Please wait while your request is being
+ * verified...", generic hCaptcha/reCAPTCHA challenge screens, or any other
+ * host's WAF/anti-bot splash page. This is exactly what was happening in
+ * practice: the daily screenshot job captured a cPanel/Imunify360
+ * verification splash instead of the real page, and nothing in the pipeline
+ * noticed or flagged it — it just silently got recorded as if it were a
+ * normal, successful capture.
+ *
+ * Detection is deliberately generic/text-based (not tied to any one
+ * provider's markup), since — same reasoning as dismissOverlays() — every
+ * hosting provider's firewall/challenge page is built differently and we
+ * can't hardcode selectors for all of them, current or future. We check the
+ * page's visible text for a set of phrases that are near-universal across
+ * these challenge pages, phrased in a way generic enough to catch new ones
+ * we haven't seen without also matching ordinary page content.
+ */
+async function looksLikeSecurityChallenge(tab) {
+  return tab.evaluate(() => {
+    const text = (document.body?.innerText || '').toLowerCase();
+    const PATTERNS = [
+      'checking your browser',
+      'just a moment',
+      'please wait while your request is being verified',
+      'verifying you are human',
+      'verify you are a human',
+      'ddos protection by',
+      'attention required! | cloudflare',
+      'please stand by, while we are checking your browser',
+      'this process is automatic',
+      'your browser will redirect shortly',
+      'ray id:', // Cloudflare's block/challenge pages always show a Ray ID
+      'access denied by imunify360',
+      'blocked by imunify360',
+      'imunify360 bot-protection',
+    ];
+    return PATTERNS.some((p) => text.includes(p));
+  }).catch(() => false);
+}
+
+/**
+ * Polls (real detection, not a blind delay) waiting for a detected
+ * challenge page to clear — many JS-based challenges auto-resolve within a
+ * few seconds for a real browser, which is exactly what Playwright's
+ * Chromium is. Returns true once the challenge text is gone (or never
+ * appeared), false if it's still present when CHALLENGE_CLEAR_TIMEOUT_MS is
+ * hit — meaning this looks like a genuine, standing block rather than a
+ * brief interstitial.
+ */
+async function waitForChallengeToClear(tab, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const stillChallenged = await looksLikeSecurityChallenge(tab);
+    if (!stillChallenged) return true;
+    await tab.waitForTimeout(1000);
+  }
+  return !(await looksLikeSecurityChallenge(tab));
+}
+
+/**
  * Combines all of the above into one "is this page actually ready to
  * screenshot" wait. Every step is real polling against page state, never a
  * blind sleep:
+ *   0. check for a bot-verification/security-challenge interstitial FIRST —
+ *      if the server's firewall is showing a "please wait, verifying..."
+ *      splash instead of the real page, there is no point scrolling for
+ *      lazy images or hunting for popups on that splash page. Poll for it to
+ *      clear (a real browser often passes automatically within seconds);
+ *      only proceed to the normal steps once it's gone (or never appeared).
  *   1. dismiss any overlay visible immediately after load
  *   2. auto-scroll (triggers lazy images), then dismiss any overlay that
  *      only appeared because of scrolling (scroll-triggered popups)
@@ -284,19 +361,35 @@ async function dismissOverlays(tab) {
  *   4. wait for any generic loading-spinner-like element to disappear
  *   5. one final overlay sweep, in case something appeared while step 3/4
  *      were polling (e.g. a timed popup that fires N seconds after load)
+ *
+ * Returns { challengeBlocked } — true if a security-challenge page was
+ * detected and NEVER cleared within CHALLENGE_CLEAR_TIMEOUT_MS, meaning
+ * whatever gets screenshotted next is very likely still the challenge splash,
+ * not the real page. The caller records this distinctly instead of silently
+ * treating it as a normal successful capture.
  */
 async function waitForRealPageReady(tab) {
-  await dismissOverlays(tab);
-  await autoScroll(tab);
-  await dismissOverlays(tab);
+  let challengeBlocked = false;
+  if (await looksLikeSecurityChallenge(tab)) {
+    const cleared = await waitForChallengeToClear(tab, CHALLENGE_CLEAR_TIMEOUT_MS);
+    challengeBlocked = !cleared;
+  }
 
-  await waitForImagesLoaded(tab, IMAGE_SETTLE_TIMEOUT_MS);
-  await waitForNoActiveSpinners(tab, IMAGE_SETTLE_TIMEOUT_MS);
+  if (!challengeBlocked) {
+    await dismissOverlays(tab);
+    await autoScroll(tab);
+    await dismissOverlays(tab);
 
-  await dismissOverlays(tab);
-  // Brief real wait tied to the overlay ceiling: if that last sweep just
-  // hid something large, let layout/reflow settle before the screenshot.
-  await tab.waitForTimeout(Math.min(500, OVERLAY_SETTLE_TIMEOUT_MS));
+    await waitForImagesLoaded(tab, IMAGE_SETTLE_TIMEOUT_MS);
+    await waitForNoActiveSpinners(tab, IMAGE_SETTLE_TIMEOUT_MS);
+
+    await dismissOverlays(tab);
+    // Brief real wait tied to the overlay ceiling: if that last sweep just
+    // hid something large, let layout/reflow settle before the screenshot.
+    await tab.waitForTimeout(Math.min(500, OVERLAY_SETTLE_TIMEOUT_MS));
+  }
+
+  return { challengeBlocked };
 }
 
 /**
@@ -329,7 +422,29 @@ export async function captureSitePage(browser, site, page) {
     // Real detection, not a fixed delay: dismiss popups, trigger + wait for
     // lazy-loaded images, wait for loading spinners to clear, sweep for any
     // popup that appeared afterward. See function docs above for details.
-    await waitForRealPageReady(tab);
+    const { challengeBlocked } = await waitForRealPageReady(tab);
+
+    if (challengeBlocked) {
+      // A bot-verification/security-challenge splash (Cloudflare, Imunify360,
+      // or similar) never cleared — whatever's on screen is that splash, not
+      // the real page. Recording it as a normal successful capture would
+      // silently store a misleading screenshot every single day, which is
+      // exactly what was happening before this check existed. We deliberately
+      // do NOT upload/save an image for this run — the previous good capture
+      // stays as the last-known-good reference — and flag it distinctly so
+      // it can be surfaced as an alert (see routes/alerts.js, Site model's
+      // screenshotChallengeStatus) instead of just disappearing into a
+      // generic error message.
+      return Screenshot.create({
+        site: site._id,
+        pageLabel: page.label,
+        pagePath: page.path,
+        fullUrl,
+        ok: false,
+        challengeBlocked: true,
+        error: 'A bot-verification/security-challenge page (e.g. Cloudflare or Imunify360) was shown instead of the real page, and did not clear in time. This site\'s hosting server is likely blocking our automated screenshot capture as bot traffic — see the Imunify360 allowlist guide, or check this server\'s firewall/WAF settings.',
+      });
+    }
 
     const pngBuffer = await tab.screenshot({ fullPage: true }); // Playwright only outputs png/jpeg natively; we take png then re-encode below for quality control
     const jpegBuffer = await sharp(pngBuffer).jpeg({ quality: JPEG_QUALITY }).toBuffer();
@@ -397,6 +512,22 @@ export async function captureSite(browser, site) {
     if (page.matchStatus === 'mismatch') { skipped.push({ label: page.label, reason: 'mismatch' }); continue; }
     results.push(await captureSitePage(browser, site, page));
   }
+
+  // Site-level challenge-blocked flag (see models/Site.js's
+  // screenshotChallengeBlocked): true if ANY page for this site hit an
+  // unresolved bot-verification challenge on this run, cleared back to false
+  // as soon as at least one page captures normally again. Auto-clearing
+  // (rather than requiring manual confirmation like imunify360Status) is
+  // deliberate here — a challenge page appearing is something the NEXT run
+  // can disprove on its own, unlike the OTP monitor's Imunify360 block which
+  // needs a human to actually go add a firewall allowlist rule before it can
+  // possibly resolve.
+  const anyChallengeBlocked = results.some((r) => r.challengeBlocked === true);
+  if (anyChallengeBlocked !== site.screenshotChallengeBlocked) {
+    site.screenshotChallengeBlocked = anyChallengeBlocked;
+    await site.save().catch(() => {}); // best-effort — a failed flag update shouldn't fail the whole capture run
+  }
+
   return { results, skipped };
 }
 

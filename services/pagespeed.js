@@ -83,7 +83,24 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // For these specific errors we wait longer than the normal retry delay
 // before trying again, giving the site's server more time to recover.
 const SLOW_SERVER_ERROR_PATTERN = /FAILED_DOCUMENT_REQUEST|ERR_TIMED_OUT|ERR_CONNECTION|timeout of \d+ms exceeded|NO_FCP/i;
-const SLOW_SERVER_RETRY_DELAY_MS = 45000; // 45s — longer than the normal 20s
+const SLOW_SERVER_RETRY_DELAY_MS = 45000; // base 45s — longer than the normal 20s
+
+// 2026-07-29: a fixed 45s slow-server delay meant the total retry window was
+// only ~45s x 4 = 180s (3 min) worst case — not always enough if the target
+// site's server stays overloaded for several minutes (observed live: a
+// server under heavy load can take 5-10+ min to recover). Instead of just
+// raising RETRY_ATTEMPTS (which multiplies Google API quota usage on every
+// single failing check), we make the slow-server delay grow with each
+// attempt — 45s, 90s, 135s, 180s — so LATER attempts wait noticeably longer,
+// giving a genuinely overloaded server real time to recover, while an
+// ordinary transient blip still gets retried quickly via the unaffected
+// normal RETRY_DELAY_MS path (non-slow-server errors still use the flat 20s).
+// Total worst-case slow-server wait across all 4 retry gaps: 45+90+135+180 =
+// 450s (7.5 min) instead of the old flat 180s (3 min) — more than double the
+// effective recovery window using the SAME number of attempts/API calls.
+function slowServerDelayForAttempt(attempt) {
+  return SLOW_SERVER_RETRY_DELAY_MS * attempt; // attempt is 1-indexed
+}
 
 function isSlowServerError(e) {
   const msg = e.response?.data?.error?.message || e.message || '';
@@ -134,8 +151,8 @@ export async function checkSitePageSpeed(site, strategy = 'mobile') {
         lastError = e;
         const isLastAttempt = attempt === RETRY_ATTEMPTS;
         const slowServer = isSlowServerError(e);
-        const delay = slowServer ? SLOW_SERVER_RETRY_DELAY_MS : RETRY_DELAY_MS;
-        console.log(`[pagespeed] ${fullUrl} (${strategy}) attempt ${attempt}/${RETRY_ATTEMPTS} failed: ${e.response?.data?.error?.message || e.message}${isLastAttempt ? '' : ` — retrying in ${delay / 1000}s${slowServer ? ' (slow-server error, extra delay)' : ''}...`}`);
+        const delay = slowServer ? slowServerDelayForAttempt(attempt) : RETRY_DELAY_MS;
+        console.log(`[pagespeed] ${fullUrl} (${strategy}) attempt ${attempt}/${RETRY_ATTEMPTS} failed: ${e.response?.data?.error?.message || e.message}${isLastAttempt ? '' : ` — retrying in ${delay / 1000}s${slowServer ? ' (slow-server error, increasing delay)' : ''}...`}`);
         if (!isLastAttempt) await sleep(delay);
       }
     }

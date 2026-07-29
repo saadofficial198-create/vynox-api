@@ -7,9 +7,11 @@ const router = express.Router();
 
 // Both /check and /check-all run in the BACKGROUND (fire-and-forget) rather
 // than awaiting the full PageSpeed run before responding. With retries this
-// can now take up to ~11 minutes per page (5 attempts x up to 120s + 20s
-// delay) — a single site with 4 monitored pages could keep an HTTP request
-// open for 45+ minutes. cPanel's LiteSpeed/Apache proxy in front of this app
+// can now take up to ~17-18 minutes per page in the worst case (5 attempts x
+// up to 120s each + growing slow-server delays of 45/90/135/180s between
+// attempts — see services/pagespeed.js's slowServerDelayForAttempt) — a
+// single site with 4 monitored pages could keep an HTTP request open for over
+// an hour in the worst case. cPanel's LiteSpeed/Apache proxy in front of this app
 // times out connections well before that (well under an hour, often under a
 // couple of minutes), which drops the response before it's sent — the
 // browser then reports this as a CORS error ("no Access-Control-Allow-Origin

@@ -108,6 +108,25 @@ const SiteSchema = new mongoose.Schema(
     //                  successful/failed OTP check is the real proof.
     imunify360Status: { type: String, enum: ['unknown', 'blocked', 'allowlisted'], default: 'unknown' },
     imunify360CheckedAt: { type: Date, default: null }, // when the status last changed
+
+    // Auto-set by services/screenshot.js whenever the daily/manual screenshot
+    // capture hits a bot-verification/security-challenge interstitial
+    // (Cloudflare "Just a moment...", Imunify360 "Please wait while your
+    // request is being verified...", etc.) that never clears — see
+    // Screenshot model's challengeBlocked field and
+    // waitForChallengeToClear(). Same reasoning/pattern as imunify360Status
+    // above (server-level firewall issue, not something we can fix
+    // remotely), but tracked separately because it's a DIFFERENT check
+    // (screenshot capture, not the OTP monitor) that can independently be
+    // blocked or allowed — a site can be allowlisted for OTP checks but
+    // still block screenshot captures, or vice versa, depending on which
+    // paths/user-agents the hosting firewall's rules cover.
+    //   - false (default) — no challenge seen on the most recent capture
+    //   - true — the most recent capture attempt hit a challenge that never
+    //     cleared; surfaced as an Alert (routes/alerts.js) until a
+    //     subsequent capture succeeds normally, which clears it back to
+    //     false automatically (see services/screenshot.js's captureSitePage).
+    screenshotChallengeBlocked: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

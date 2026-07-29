@@ -138,6 +138,24 @@ function deriveAlerts(site, snap) {
     );
   }
 
+  // Auto-set/cleared by services/screenshot.js's captureSite whenever the
+  // screenshot job hits a bot-verification/security-challenge splash
+  // (Cloudflare, Imunify360, etc.) that never clears — see models/Site.js's
+  // screenshotChallengeBlocked. Unlike imunify360-blocked above, this clears
+  // itself automatically the next time a capture succeeds normally, so it
+  // doesn't need a "mark resolved" step — it's just surfaced here so it's
+  // visible in the dashboard instead of only showing up as a generic failed
+  // capture in the Scans/Reports history.
+  if (site.screenshotChallengeBlocked) {
+    push(
+      'screenshot-challenge-blocked',
+      'Screenshots Blocked by Security Challenge',
+      'The daily screenshot capture is being shown a bot-verification/security-challenge page (e.g. Cloudflare or Imunify360 "please wait, verifying...") instead of the real page, on this site\'s hosting server. Check that server\'s firewall/WAF settings — see Imunify360_Allowlist_Guide.md if it uses Imunify360. This clears automatically once a capture succeeds normally again.',
+      'Configuration',
+      'medium'
+    );
+  }
+
   return out;
 }
 

@@ -13,6 +13,17 @@ const ScreenshotSchema = new mongoose.Schema(
     ok:         { type: Boolean, default: true },
     error:      { type: String, default: null },
 
+    // True when this capture attempt hit a bot-verification/security-
+    // challenge interstitial (Cloudflare "Just a moment...", Imunify360
+    // "Please wait while your request is being verified...", etc.) that
+    // never cleared — see services/screenshot.js's waitForChallengeToClear.
+    // Always paired with ok: false and no image (we deliberately don't
+    // upload/store the misleading challenge-page screenshot itself). This
+    // is distinct from a normal ok:false (network error, timeout, DNS
+    // failure, ...) so the dashboard/alerts can give a specific, actionable
+    // message instead of a generic "capture failed".
+    challengeBlocked: { type: Boolean, default: false },
+
     // Stored on cPanel via SFTP (not on the backend's local disk — see
     // services/sftpUpload.js). relativePath is what we pass to SFTP upload/
     // delete; publicUrl is the direct HTTP(S) link since the folder lives

@@ -26,7 +26,15 @@ on:
 jobs:
   screenshots:
     runs-on: ubuntu-latest
-    timeout-minutes: 90 # generous ceiling — actual runs should finish well under this even at 150 sites
+    # 2026-07-29: bumped from 90 -> 180. Per-page capture now waits for REAL
+    # load completion (images actually decoded, popups dismissed, no active
+    # spinner) instead of a fixed 25s timeout — see services/screenshot.js
+    # and the vynox-api README's Change Log entry for that date. Worst case
+    # per page is now ~60s nav ceiling + ~45s settle ceiling ≈ 105-110s if a
+    # page hits every ceiling (rare — most pages finish in a few seconds),
+    # vs. the old fixed ~25s. 180 min keeps headroom at ~150 sites x
+    # multiple pages each even if several sites are unusually slow.
+    timeout-minutes: 180
     steps:
       - name: Check out repo
         uses: actions/checkout@v4

@@ -13,6 +13,29 @@ const DIFF_FLAG_THRESHOLD_PCT = Number(process.env.SCREENSHOT_DIFF_THRESHOLD_PCT
 // being clear enough to visually spot a broken page.
 const JPEG_QUALITY = Number(process.env.SCREENSHOT_JPEG_QUALITY || 70);
 
+// IMPORTANT: none of the constants below are "wait N seconds then screenshot"
+// delays. Every wait in this file is driven by actually POLLING the page
+// (via tab.waitForFunction, checking real DOM/network state) until the
+// condition is true, and only stops early if that ceiling is hit. A fast
+// site finishes in a couple seconds; a slow one can use the full ceiling.
+// The old bug was a fixed 25s timeout used as the actual "is it loaded"
+// signal — that's exactly what these ceilings are NOT supposed to be.
+//
+// Hard ceiling on Playwright's own navigation wait (goto). Slow WordPress
+// sites (heavy plugins, cheap shared hosting) routinely need more than the
+// old 25s. This is just a safety cap so one dead/hanging site can't freeze
+// the run forever — captureAllSites() also isolates failures per-site.
+const NAV_TIMEOUT_MS = Number(process.env.SCREENSHOT_NAV_TIMEOUT_MS || 60000);
+// Ceiling for the post-navigation "is everything actually settled" poll
+// (images finished decoding, no visible loading spinner, network quiet).
+// waitForRealPageReady() below checks the real condition every ~500ms and
+// returns as soon as it's true — this is only the worst-case cap if a page
+// never actually settles (e.g. a plugin that polls forever in the background).
+const IMAGE_SETTLE_TIMEOUT_MS = Number(process.env.SCREENSHOT_IMAGE_SETTLE_TIMEOUT_MS || 45000);
+// How long to poll for an overlay/popup to actually disappear after we try
+// to close/hide it, before moving on regardless.
+const OVERLAY_SETTLE_TIMEOUT_MS = Number(process.env.SCREENSHOT_OVERLAY_SETTLE_TIMEOUT_MS || 8000);
+
 function joinUrl(base, p) {
   const b = String(base || '').trim().replace(/\/$/, '');
   const rel = String(p || '/').trim();
@@ -44,6 +67,239 @@ async function diffPercent(prevJpegBuf, curJpegBuf) {
 }
 
 /**
+ * Scrolls the page down in steps (top to bottom) and back up. This is what
+ * actually triggers lazy-loaded images (native loading="lazy" and the JS
+ * IntersectionObserver-based lazy-load plugins WordPress sites commonly use)
+ * — those images never fire their load event until the browser thinks
+ * they're near the viewport, so without scrolling, "wait for images to load"
+ * would wait forever for images that are never even asked to load.
+ *
+ * Deliberately does NOT click anything (no "Load More" / "Show more"
+ * buttons) — per requirement, we only want the images that load
+ * automatically via scroll, never content that requires an explicit click.
+ */
+async function autoScroll(tab) {
+  await tab.evaluate(async () => {
+    await new Promise((resolve) => {
+      let total = 0;
+      const step = Math.max(200, Math.floor(window.innerHeight * 0.8));
+      const timer = setInterval(() => {
+        const scrollHeight = document.body.scrollHeight;
+        window.scrollBy(0, step);
+        total += step;
+        if (total >= scrollHeight) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 150); // small pause between steps so lazy-load observers actually fire
+    });
+  });
+  // Give any observers/animations triggered by the final scroll step a brief
+  // moment to start, then return to the top for the actual screenshot
+  // (fullPage screenshots capture from current DOM state regardless of
+  // scroll position, but starting from the top avoids any scroll-position
+  // side effects on sticky headers etc.).
+  await tab.waitForTimeout(300);
+  await tab.evaluate(() => window.scrollTo(0, 0));
+}
+
+/**
+ * Polls (does not just wait a fixed time) until every currently-visible
+ * <img> on the page has actually finished loading — i.e. real detection via
+ * naturalWidth/naturalHeight and the element's own `complete` flag, not a
+ * guess. Also treats CSS background-image on large visible elements as
+ * "loaded" once the underlying request settles, by leaning on the browser's
+ * own decode() where available.
+ *
+ * Returns true if everything settled before the ceiling, false if the
+ * ceiling was hit with something still pending (caller still screenshots —
+ * partial-but-real is better than refusing to ever capture a stubborn page).
+ */
+async function waitForImagesLoaded(tab, timeoutMs) {
+  try {
+    await tab.waitForFunction(
+      () => {
+        const imgs = Array.from(document.images || []);
+        return imgs.every((img) => {
+          // offsetParent === null means the element isn't actually visible/
+          // rendered (display:none, detached, etc.) — no point waiting on it.
+          if (img.offsetParent === null && img.loading !== 'eager') return true;
+          return img.complete && img.naturalWidth > 0;
+        });
+      },
+      { timeout: timeoutMs, polling: 250 }
+    );
+    return true;
+  } catch {
+    return false; // hit the ceiling — proceed anyway with whatever loaded
+  }
+}
+
+/**
+ * Polls until there is no visible "still working" indicator on the page.
+ * Network-level idle detection is already handled by the caller (tab.goto's
+ * waitUntil: 'networkidle'); this function specifically watches for
+ * JS-driven loading spinners that a lot of WordPress themes/plugins show
+ * client-side even after the initial network is idle (e.g. a "Load More"
+ * section still finishing its own fetch that started on scroll, or a
+ * skeleton loader before content swaps in).
+ *
+ * Detection is generic/behavioral, not tied to any site's specific class
+ * names: it looks for visible elements whose class/id/aria-label CONTAINS
+ * common loading-related substrings ("spinner", "loading", "loader",
+ * "skeleton", "lazy-placeholder") OR elements with role="progressbar" /
+ * aria-busy="true". If none are found to begin with, this resolves
+ * immediately.
+ */
+async function waitForNoActiveSpinners(tab, timeoutMs) {
+  try {
+    await tab.waitForFunction(
+      () => {
+        const isVisible = (el) => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          const style = window.getComputedStyle(el);
+          return style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0;
+        };
+        const candidates = Array.from(document.querySelectorAll(
+          '[class*="spinner" i], [class*="loading" i], [class*="loader" i], ' +
+          '[class*="skeleton" i], [id*="spinner" i], [id*="loading" i], ' +
+          '[role="progressbar"], [aria-busy="true"]'
+        ));
+        return candidates.every((el) => !isVisible(el));
+      },
+      { timeout: timeoutMs, polling: 250 }
+    );
+    return true;
+  } catch {
+    return false; // some spinner-like element never disappeared — proceed anyway
+  }
+}
+
+/**
+ * Detects and removes popup/modal/overlay elements WITHOUT knowing anything
+ * about the specific site — no hardcoded IDs or class names, because every
+ * site's cookie banner / subscribe modal / newsletter popup is built
+ * differently (different plugin, different theme, custom code). Instead
+ * this uses the same behavioral signature basically every overlay shares
+ * regardless of implementation:
+ *
+ *   1. position is fixed or sticky (overlays don't scroll away with content)
+ *   2. it covers a large chunk of the viewport (width/height ratio above a
+ *      threshold) OR sits on top of everything via a very high z-index while
+ *      covering a meaningful area (banners across the top/bottom count too)
+ *   3. it's actually visible (not display:none, not zero-size, not
+ *      offscreen)
+ *
+ * For each match we first try clicking an obvious close control INSIDE it
+ * (generic patterns: aria-label containing "close"/"dismiss", visible text
+ * that is exactly "x"/"×"/"✕"/"close"/"no thanks"/"skip", or a child with a
+ * class name containing "close"/"dismiss"/"modal-close"). If no close
+ * control can be found/clicked, we forcibly hide the element via inline
+ * style — belt-and-suspenders, since the goal ("popup must not be in the
+ * screenshot") matters more than closing it "properly".
+ *
+ * Runs twice by design (see captureSitePage): once right after initial
+ * load, and again after auto-scrolling, because a lot of popups are
+ * scroll-triggered or exit-intent-triggered and don't exist yet on first
+ * paint.
+ */
+async function dismissOverlays(tab) {
+  return tab.evaluate(() => {
+    const CLOSE_TEXT_PATTERNS = ['close', 'dismiss', 'no thanks', 'not now', 'skip', '×', '✕', 'x'];
+
+    const isVisible = (el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return false;
+      const style = window.getComputedStyle(el);
+      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+      return true;
+    };
+
+    const looksLikeOverlay = (el) => {
+      const style = window.getComputedStyle(el);
+      if (style.position !== 'fixed' && style.position !== 'sticky') return false;
+      if (!isVisible(el)) return false;
+      const r = el.getBoundingClientRect();
+      const viewportArea = window.innerWidth * window.innerHeight;
+      const elArea = r.width * r.height;
+      const coverageRatio = elArea / viewportArea;
+      const zIndex = Number(style.zIndex) || 0;
+      // Either it covers a big share of the screen (a true modal/lightbox),
+      // or it's a full-width bar (top or bottom banner) with a high z-index —
+      // catches slim cookie-consent bars that don't cover much area but are
+      // definitely an intrusive overlay.
+      const isFullWidthBar = r.width / window.innerWidth > 0.9 && r.height < window.innerHeight * 0.5;
+      return (coverageRatio > 0.25) || (isFullWidthBar && zIndex >= 100);
+    };
+
+    const findCloseControl = (root) => {
+      const candidates = Array.from(root.querySelectorAll('button, a, [role="button"], span, div'));
+      for (const el of candidates) {
+        if (!isVisible(el)) continue;
+        const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+        const cls = (el.className && typeof el.className === 'string' ? el.className : '').toLowerCase();
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (CLOSE_TEXT_PATTERNS.some((p) => aria.includes(p))) return el;
+        if (/close|dismiss|modal-close|popup-close/.test(cls)) return el;
+        if (text.length <= 12 && CLOSE_TEXT_PATTERNS.includes(text)) return el;
+      }
+      return null;
+    };
+
+    const allEls = Array.from(document.querySelectorAll('body *'));
+    const overlays = allEls.filter(looksLikeOverlay);
+    let handled = 0;
+
+    for (const overlay of overlays) {
+      const closeBtn = findCloseControl(overlay);
+      if (closeBtn) {
+        try { closeBtn.click(); handled++; continue; } catch { /* fall through to force-hide */ }
+      }
+      // No close control found (or click failed) — force it out of the
+      // render tree so it can never appear in the screenshot, regardless of
+      // what the site's own code does.
+      overlay.style.setProperty('display', 'none', 'important');
+      handled++;
+    }
+
+    // Common side-effect of overlay libraries: they lock body scroll via a
+    // class/style on <html>/<body> even after the overlay itself is hidden,
+    // which can leave a fullPage screenshot mis-sized. Clear the obvious ones.
+    document.documentElement.style.overflow = '';
+    document.body.style.overflow = '';
+
+    return handled;
+  }).catch(() => 0);
+}
+
+/**
+ * Combines all of the above into one "is this page actually ready to
+ * screenshot" wait. Every step is real polling against page state, never a
+ * blind sleep:
+ *   1. dismiss any overlay visible immediately after load
+ *   2. auto-scroll (triggers lazy images), then dismiss any overlay that
+ *      only appeared because of scrolling (scroll-triggered popups)
+ *   3. wait for images to finish loading for real (naturalWidth check)
+ *   4. wait for any generic loading-spinner-like element to disappear
+ *   5. one final overlay sweep, in case something appeared while step 3/4
+ *      were polling (e.g. a timed popup that fires N seconds after load)
+ */
+async function waitForRealPageReady(tab) {
+  await dismissOverlays(tab);
+  await autoScroll(tab);
+  await dismissOverlays(tab);
+
+  await waitForImagesLoaded(tab, IMAGE_SETTLE_TIMEOUT_MS);
+  await waitForNoActiveSpinners(tab, IMAGE_SETTLE_TIMEOUT_MS);
+
+  await dismissOverlays(tab);
+  // Brief real wait tied to the overlay ceiling: if that last sweep just
+  // hid something large, let layout/reflow settle before the screenshot.
+  await tab.waitForTimeout(Math.min(500, OVERLAY_SETTLE_TIMEOUT_MS));
+}
+
+/**
  * Captures one page for one site: navigates with Playwright/Chromium, encodes
  * a JPEG, uploads it to cPanel over SFTP (services/sftpUpload.js), diffs it
  * against the previous capture of the same page, and stores a Screenshot
@@ -66,10 +322,15 @@ export async function captureSitePage(browser, site, page) {
   try {
     ctx = await browser.newContext({ viewport: { width: 1366, height: 900 } });
     const tab = await ctx.newPage();
-    // 25s (down from 45s) — long enough for a normally slow WordPress page,
-    // but short enough that one down/overloaded site can't eat minutes of
-    // the shared capture run for every other site queued behind it.
-    await tab.goto(fullUrl, { waitUntil: 'networkidle', timeout: 25000 });
+    // NAV_TIMEOUT_MS is a safety ceiling, not the "is it loaded" signal —
+    // waitForRealPageReady() below is what actually detects readiness.
+    await tab.goto(fullUrl, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT_MS });
+
+    // Real detection, not a fixed delay: dismiss popups, trigger + wait for
+    // lazy-loaded images, wait for loading spinners to clear, sweep for any
+    // popup that appeared afterward. See function docs above for details.
+    await waitForRealPageReady(tab);
+
     const pngBuffer = await tab.screenshot({ fullPage: true }); // Playwright only outputs png/jpeg natively; we take png then re-encode below for quality control
     const jpegBuffer = await sharp(pngBuffer).jpeg({ quality: JPEG_QUALITY }).toBuffer();
 

@@ -73,7 +73,20 @@ router.post('/register', async (req, res) => {
       { url: cleaned },
       {
         $set: { apiKey, status: 'unknown', lastCheckedAt: new Date() },
-        $setOnInsert: { name: name || cleaned, tags: [], notes: '' },
+        // Only applied on a genuinely NEW site (upsert insert), never on a
+        // re-registration of an existing one — so this doesn't clobber a
+        // site's real, already-saved monitoredPages/pagesConfigured. Home
+        // ('/') is seeded immediately and enabled for capture right away
+        // (see POST / above for why: it's never a guessed slug, so there's
+        // no reason to gate it behind manual Settings review like
+        // Shop/Contact Us/Track Order are).
+        $setOnInsert: {
+          name: name || cleaned,
+          tags: [],
+          notes: '',
+          monitoredPages: [{ label: 'Home', path: '/', enabled: true, matchStatus: 'ok' }],
+          pagesConfigured: true,
+        },
       },
       { new: true, upsert: true }
     );
@@ -104,18 +117,17 @@ router.post('/register', async (req, res) => {
         }
       } catch { /* registration already succeeded; ignore background errors */ }
 
-      // NOTE: we deliberately do NOT auto-apply detectMonitoredPages() (or
-      // any hardcoded default) here anymore. A site the plugin just
-      // auto-registered starts with pagesConfigured: false, and
-      // screenshot/PageSpeed capture both skip any site where that's false
-      // (see services/screenshot.js, services/pagespeed.js) — an Alert is
-      // raised instead ("Monitored pages not configured yet"). The user
-      // must explicitly open Settings, review the live sitemap-detected
+      // NOTE: we deliberately do NOT auto-apply detectMonitoredPages() (the
+      // Shop/Contact Us/Track Order guesses) here — those guessed slugs are
+      // frequently wrong, and running against a wrong/404 page is exactly
+      // the silent-garbage-data problem this feature exists to avoid. The
+      // user must explicitly open Settings, review the live sitemap-detected
       // page candidates (GET /:id/page-candidates), and save their
-      // selection (PUT /:id/monitored-pages) before any capture starts.
-      // This avoids silently running checks against wrong/404 pages using
-      // guessed slugs, which was the actual root cause of misleading
-      // "Failed" screenshots/PageSpeed results reported earlier.
+      // selection (PUT /:id/monitored-pages) to add anything beyond Home.
+      // Home itself, however, IS seeded automatically above ($setOnInsert)
+      // and pagesConfigured starts true — Home is never a guess (always
+      // "/"), so capture starts on it immediately without waiting on a
+      // human to open Settings.
     })();
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
@@ -155,12 +167,18 @@ router.post('/', async (req, res) => {
       wpVersion: r.data.wp_version || null,
       tags: Array.isArray(tags) ? tags : [],
       notes: notes || '',
+      // Home ('/') is a permanent monitored page for every site — unlike
+      // Shop/Contact Us/Track Order (which need sitemap review before
+      // capture starts, since a wrong guessed slug means a misleading 404
+      // screenshot), Home is never a guess: it's always exactly "/". So
+      // there's no reason to gate it behind manual Settings review —
+      // pagesConfigured starts true and screenshot/PageSpeed capture begins
+      // on Home right away. The user can still add Shop/Contact/etc. later
+      // in Settings; this only seeds the one page we can never get wrong.
+      monitoredPages: [{ label: 'Home', path: '/', enabled: true, matchStatus: 'ok' }],
+      pagesConfigured: true,
     });
     res.json({ ok: true, site });
-    // Same as /register above: pagesConfigured defaults to false, and no
-    // page auto-detection is applied here — the user picks pages explicitly
-    // in Settings (GET /:id/page-candidates + PUT /:id/monitored-pages)
-    // before screenshot/PageSpeed capture will run for this site.
   } catch (e) {
     if (e.code === 11000) {
       return res.status(409).json({ ok: false, error: 'Site already exists at that URL' });
@@ -224,6 +242,15 @@ router.put('/:id/monitored-pages', async (req, res) => {
     }
   }
 
+  // Home ('/') is a permanent monitored page — every site, no exceptions.
+  // The frontend picker already locks its checkbox so it can't be
+  // unchecked, but enforcing it here too means a stale/cached frontend
+  // build, a direct API call, or any future client can never actually save
+  // a selection missing Home.
+  if (!incoming.some(p => p.path.trim() === '/')) {
+    incoming.unshift({ label: 'Home', path: '/', enabled: true });
+  }
+
   // Preserve matchStatus/lastMatchedAt/lastMismatchAt for any page whose
   // path already existed in the saved list (editing labels/enabled doesn't
   // reset its known-good history); anything genuinely new starts 'unknown'.
@@ -234,8 +261,8 @@ router.put('/:id/monitored-pages', async (req, res) => {
     return {
       label: p.label.trim(),
       path,
-      enabled: p.enabled !== false,
-      matchStatus: prev?.matchStatus || 'unknown',
+      enabled: path === '/' ? true : p.enabled !== false, // Home is always enabled too, not just present
+      matchStatus: prev?.matchStatus || (path === '/' ? 'ok' : 'unknown'),
       lastMatchedAt: prev?.lastMatchedAt || null,
       lastMismatchAt: prev?.lastMismatchAt || null,
     };

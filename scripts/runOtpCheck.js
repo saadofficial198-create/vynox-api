@@ -44,7 +44,15 @@ function computeOverallStatus({ otpPluginActive, smtpPluginActive, smtpConfigure
   if (otpPluginActive === null) return 'not_applicable'; // no snapshot yet — nothing to report either way
   if (otpPluginActive === false) return 'not_applicable'; // this site doesn't run the OTP plugin at all — not a failure
   if (smtpPluginActive === false) return 'fail_plugin_inactive';
-  if (smtpConfigured === false) return 'fail_smtp_not_configured';
+  // `smtpConfigured` is `null` (not `false`) when the connector plugin
+  // couldn't determine SMTP config at all (e.g. it detected the "WP Mail
+  // SMTP" plugin from the active-plugins list but its own status check
+  // came back empty/undetected — see vynox-connector.php's
+  // vynox_get_wp_mail_smtp_status()). Either way Layer 3 can't safely run,
+  // so treat "unknown" the same as "not configured" — falling through to
+  // the generic 'error' status here used to hide a real, actionable finding
+  // behind a vague label.
+  if (smtpConfigured !== true) return 'fail_smtp_not_configured';
   if (!layer3Attempted) return 'error';
   if (!popupAppeared) return 'fail_checkout_trigger';
   if (!emailFound) return 'fail_email_not_received';

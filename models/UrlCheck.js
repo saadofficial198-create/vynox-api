@@ -17,6 +17,14 @@ const UrlCheckSchema = new mongoose.Schema(
     },
     error: { type: String, default: null },
 
+    // Sub-state only meaningful while status is 'running' — lets the
+    // frontend show what's actually happening during the (potentially
+    // multi-minute) page-discovery phase instead of a frozen-looking
+    // "Scanned 0 of … pages found", which was confirmed live to read as
+    // "this is stuck" even though it was working normally.
+    phase:      { type: String, enum: ['discovering', 'scanning', null], default: 'discovering' },
+    phaseLabel: { type: String, default: null }, // e.g. "checking sitemap…", "crawling site links…"
+
     // Page-discovery progress — how many pages were found (across
     // monitoredPages/REST-API/sitemap/link-crawl) and how many have been
     // scanned so far. Lets the frontend poll and show live progress instead

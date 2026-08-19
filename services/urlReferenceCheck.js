@@ -69,12 +69,14 @@ async function getAllSitemapUrlsThorough(baseUrl, { maxSitemaps = 60 } = {}) {
 
     if (!/<sitemapindex/i.test(xml)) return locs;
 
+    // Fetched concurrently, not one-at-a-time — a WooCommerce store's
+    // sitemap index commonly lists dozens of product/category sub-sitemaps,
+    // and fetching them sequentially (up to maxSitemaps * 15s) was the
+    // single biggest contributor to this whole check looking "stuck" for
+    // several minutes before scanning even started.
     const subSitemaps = locs.slice(0, maxSitemaps);
-    const all = [];
-    for (const sm of subSitemaps) {
-      const subXml = await fetchText(sm, 15000);
-      if (subXml) all.push(...extractLocs(subXml));
-    }
+    const subResults = await mapWithConcurrency(subSitemaps, 8, (sm) => fetchText(sm, 15000));
+    const all = subResults.filter(Boolean).flatMap(extractLocs);
     return all.length ? all : locs;
   }
   return [];
@@ -141,9 +143,17 @@ async function mapWithConcurrency(items, limit, fn) {
  *      catches everything neither of the above listed, and is the only
  *      source that still works when a site has no sitemap AND blocks the
  *      REST API.
+ * `onProgress(urls.length, phaseLabel)` is called after each source finishes
+ * (and periodically during the crawl) purely so a caller can persist "here's
+ * what we've found so far, still looking" — discovery alone can take a
+ * couple of minutes on a big store, and with no feedback during that window
+ * it reads as "stuck" even though it's working (confirmed live: a user
+ * watched "Scanned 0 of … pages found" for several minutes and assumed the
+ * check had broken).
  * @returns {Promise<{ urls: string[], truncated: boolean, sources: object }>}
  */
-export async function discoverAllPages(site, { cap = 3000, crawlMaxPages = 1200, crawlMaxDepth = 3, crawlConcurrency = 6 } = {}) {
+export async function discoverAllPages(site, opts = {}) {
+  const { cap = 3000, crawlMaxPages = 1200, crawlMaxDepth = 3, crawlConcurrency = 6, onProgress, deadlineTs = Infinity } = opts;
   const base = cleanUrl(site.url);
   const host = new URL(base).hostname;
   const seen = new Set();
@@ -164,9 +174,11 @@ export async function discoverAllPages(site, { cap = 3000, crawlMaxPages = 1200,
   for (const p of site.monitoredPages || []) {
     if (p?.path) add(base + p.path, 'monitoredPages');
   }
+  onProgress?.(urls.length, 'checking WordPress REST API…');
 
   const restPages = await fetchPagesFromRestApi(base).catch(() => []);
   for (const link of restPages) add(link, 'restApi');
+  onProgress?.(urls.length, 'checking sitemap…');
 
   let sitemapUrls = [];
   try {
@@ -174,16 +186,20 @@ export async function discoverAllPages(site, { cap = 3000, crawlMaxPages = 1200,
   } catch { sitemapUrls = []; }
   if (sitemapUrls.length > cap - urls.length) truncated = true;
   for (const u of sitemapUrls) add(u, 'sitemap');
+  onProgress?.(urls.length, 'crawling site links…');
 
   // Same-host link crawl — always run as a supplement (not just when the
   // above found nothing), since it catches pages neither the sitemap nor
   // the REST API listed. Capped separately (crawlMaxPages) from the overall
   // `cap` so a slow/huge site doesn't spend its entire budget crawling
-  // before ever getting to scan anything.
+  // before ever getting to scan anything. Also bails once `deadlineTs`
+  // passes, same reasoning as the equivalent check in runUrlCheck's scan
+  // loop — discovery alone shouldn't be able to run forever on a site with
+  // an enormous or cyclical link graph.
   const queue = [{ url: base, depth: 0 }];
   const queued = new Set([normalizePageUrl(base)]);
   let crawled = 0;
-  while (queue.length && crawled < crawlMaxPages && urls.length < cap) {
+  while (queue.length && crawled < crawlMaxPages && urls.length < cap && Date.now() < deadlineTs) {
     const batch = queue.splice(0, crawlConcurrency);
     const htmls = await mapWithConcurrency(batch, crawlConcurrency, (item) => fetchText(item.url, 12000));
     for (let i = 0; i < batch.length; i++) {
@@ -199,8 +215,9 @@ export async function discoverAllPages(site, { cap = 3000, crawlMaxPages = 1200,
         queue.push({ url: link, depth: depth + 1 });
       }
     }
+    onProgress?.(urls.length, 'crawling site links…');
   }
-  if (queue.length && crawled >= crawlMaxPages) truncated = true;
+  if (queue.length && (crawled >= crawlMaxPages || Date.now() >= deadlineTs)) truncated = true;
 
   return { urls, truncated, sources };
 }
@@ -243,27 +260,59 @@ export async function scanUrlForDomain(pageUrl, oldDomain) {
   return { ok: true, error: null, matchCount, snippets };
 }
 
+// Overall wall-clock ceiling for one run (discovery + scanning combined).
+// Without this, a pathological site (huge/cyclical link graph, thousands of
+// slow-responding product pages) could keep a check "running" indefinitely
+// — and since the frontend disables "Scan Now" while status is 'running',
+// that would leave the user with no way to retry. Whatever's been found by
+// the deadline is reported as a (truncated) completed result rather than a
+// failure — a partial answer is still useful.
+const MAX_RUN_MS = 25 * 60 * 1000;
+
 /**
  * Full run: discover every page, scan each for `oldDomain`, and write
  * progress into `doc` (a UrlCheck mongoose document) as it goes so the
  * frontend can poll GET /api/url-check/:siteId/latest for live progress
- * instead of waiting for the whole thing to finish. Sites can have
- * thousands of pages, so this can legitimately take minutes.
+ * instead of watching a frozen-looking "Scanned 0 of … pages found" during
+ * the (potentially multi-minute) discovery phase. Sites can have thousands
+ * of pages, so the whole thing can legitimately take minutes.
  */
 export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } = {}) {
-  const { urls, truncated, sources } = await discoverAllPages(site);
+  const deadlineTs = Date.now() + MAX_RUN_MS;
 
+  doc.phase = 'discovering';
+  await doc.save();
+
+  let sinceLastDiscoverySave = 0;
+  const { urls, truncated: discoveryTruncated, sources } = await discoverAllPages(site, {
+    deadlineTs,
+    onProgress: (count, phaseLabel) => {
+      doc.totalPages = count;
+      doc.phaseLabel = phaseLabel;
+      // Throttled the same way the scan-progress saves below are — this
+      // fires once per source plus once per crawl batch, which on a big
+      // crawl could otherwise be dozens of writes in quick succession.
+      if (++sinceLastDiscoverySave >= 5) {
+        sinceLastDiscoverySave = 0;
+        doc.save().catch(() => {});
+      }
+    },
+  });
+
+  doc.phase = 'scanning';
+  doc.phaseLabel = null;
   doc.totalPages = urls.length;
   doc.discoverySources = sources;
-  doc.truncated = truncated;
   doc.scannedPages = 0;
   await doc.save();
 
   const matches = [];
   let scanned = 0;
   let sinceLastSave = 0;
+  let timedOut = false;
 
   await mapWithConcurrency(urls, scanConcurrency, async (pageUrl) => {
+    if (Date.now() >= deadlineTs) { timedOut = true; return; }
     const result = await scanUrlForDomain(pageUrl, oldDomain);
     scanned++;
     sinceLastSave++;
@@ -283,6 +332,9 @@ export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } 
   });
 
   doc.matches = matches;
+  doc.scannedPages = scanned;
+  doc.truncated = discoveryTruncated || timedOut || scanned < urls.length;
+  doc.phase = null;
   doc.status = 'completed';
   doc.finishedAt = new Date();
   await doc.save();

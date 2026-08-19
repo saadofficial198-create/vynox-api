@@ -44,12 +44,30 @@ router.post('/:siteId/run', async (req, res) => {
     .finally(() => runningSites.delete(siteId));
 });
 
+// Shared cPanel Node hosting restarts this process fairly often (every code/
+// env deploy — see server.js's comments on the same theme elsewhere in this
+// app). If that happens mid-run, the in-memory `runningSites` guard resets,
+// but the UrlCheck doc is left stuck at status:'running' forever with no
+// process left to finish it — and the frontend disables "Scan Now" while
+// status is 'running', so the user would have no way to retry. `doc.save()`
+// during a real run touches `updatedAt` every few pages (via mongoose's
+// timestamps), so "no update in a long while" reliably means "the run died",
+// not "it's just slow".
+const STALE_RUNNING_MS = 20 * 60 * 1000;
+
 // GET /api/url-check/:siteId/latest — most recent run for this site (any
 // status — 'running' so the frontend can poll progress, 'completed'/
 // 'failed' for the final result).
 router.get('/:siteId/latest', async (req, res) => {
-  const doc = await UrlCheck.findOne({ site: req.params.siteId }).sort({ createdAt: -1 }).lean();
-  res.json({ ok: true, check: doc || null });
+  const doc = await UrlCheck.findOne({ site: req.params.siteId }).sort({ createdAt: -1 });
+  if (doc && doc.status === 'running' && Date.now() - doc.updatedAt.getTime() > STALE_RUNNING_MS) {
+    doc.status = 'failed';
+    doc.error = 'This check did not finish in a reasonable time (the backend process likely restarted mid-run) — click Scan Now to retry.';
+    doc.finishedAt = new Date();
+    await doc.save();
+    runningSites.delete(String(req.params.siteId));
+  }
+  res.json({ ok: true, check: doc ? doc.toObject() : null });
 });
 
 // GET /api/url-check/:siteId/history — recent runs (e.g. to compare before/

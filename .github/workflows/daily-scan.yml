@@ -45,7 +45,16 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # this just makes one HTTP call and waits for the backend to finish its loop
+    # 2026-08-19: routes/scan.js's /run-all now responds 202 immediately and
+    # runs scanAllSites() in the background (same fire-and-forget pattern as
+    # /run-pagespeed) — it used to await the full loop before responding,
+    # which regularly exceeded cPanel's ~2min LiteSpeed proxy timeout once
+    # there were enough sites (or one slow one), failing this workflow with
+    # a 500 even though the scan itself finished fine server-side. This job
+    # now just confirms the run STARTED, so 15 min of headroom is far more
+    # than the single HTTP call needs — kept generous in case the backend
+    # itself is briefly slow to respond (cold start, etc.).
+    timeout-minutes: 15
     steps:
       - name: Trigger daily scan
         env:

@@ -15,7 +15,21 @@ let runningPageSpeed = false;
 // shared secret header since this replaces the old manual per-site "Sync"
 // button — it's now only meant to be called by the daily GitHub Actions
 // workflow (.github/workflows/daily-scan.yml), not the frontend.
-router.post('/run-all', async (req, res) => {
+//
+// Runs in the BACKGROUND (fire-and-forget, responds 202 immediately) — same
+// reasoning as /run-pagespeed below. scanAllSites() loops every site
+// SEQUENTIALLY, and each site's own connector call can take up to 60s
+// (callConnector's timeout) before even getting to the alert-sync/email/
+// sitemap-refresh work — with enough sites, or just one slow/hanging one,
+// the total easily exceeds cPanel's LiteSpeed reverse-proxy "Connection
+// Timeout" (~2 minutes, observed live: GitHub Actions got back LiteSpeed's
+// own "This request takes too long to process" HTML page as a 500, even
+// though scanAllSites() itself was still running fine server-side — the
+// PROXY gave up on the client connection, not the Node process). Responding
+// immediately means the workflow just confirms the run STARTED; Site/
+// Snapshot/Alert updates land in MongoDB as each site finishes, same as
+// /run-pagespeed already does.
+router.post('/run-all', (req, res) => {
   const expected = process.env.SCAN_TRIGGER_SECRET;
   const provided = req.get('X-Scan-Secret');
 
@@ -31,14 +45,12 @@ router.post('/run-all', async (req, res) => {
   }
 
   running = true;
-  try {
-    const summary = await scanAllSites();
-    res.json({ ok: true, summary });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  } finally {
-    running = false;
-  }
+  res.status(202).json({ ok: true, message: 'Daily scan started — Site/Snapshot/Alert updates land in MongoDB as each site finishes.' });
+
+  scanAllSites()
+    .then((summary) => console.log('[scan] run-all complete:', JSON.stringify(summary)))
+    .catch((e) => console.error('[scan] run-all failed:', e.message))
+    .finally(() => { running = false; });
 });
 
 // POST /api/scan/run-pagespeed — triggers a Desktop PageSpeed check for

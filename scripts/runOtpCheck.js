@@ -71,6 +71,7 @@ async function checkOneSite(site) {
     site: site._id,
     checkedAt: new Date(),
     otpPluginActive: prereq.otpPluginActive,
+    otpProvider: prereq.otpProvider,
     smtpPluginActive: prereq.smtpPluginActive,
     smtpConfigured: prereq.smtpConfigured,
     smtpMailer: prereq.smtpMailer,
@@ -83,18 +84,27 @@ async function checkOneSite(site) {
     deliveryLatencyMs: null,
   };
 
+  // 'vynox' provider's monitoring action authenticates with the site's own
+  // connector API key (see services/otpCheck.js) instead of a checkout
+  // nonce/cart — without it, Layer 3 can't even attempt the call, so treat
+  // that the same as "prerequisites not met" rather than trying and getting
+  // a confusing auth-failure error. In practice Site.apiKey is always set
+  // (required at registration — see models/Site.js), but this stays
+  // defensive rather than assuming that.
+  const readyForLayer3 = prereq.readyForLayer3 && (prereq.otpProvider !== 'vynox' || !!site.apiKey);
+
   if (prereq.otpPluginActive === null) {
     console.log('[runOtpCheck] no snapshot data yet for this site — skipping until the next daily scan runs.');
   } else if (prereq.otpPluginActive === false) {
     console.log('[runOtpCheck] OTP plugin not active on this site — not applicable, skipping.');
-  } else if (!prereq.readyForLayer3) {
+  } else if (!readyForLayer3) {
     console.log('[runOtpCheck] prerequisites not met — skipping Layer 3 (AJAX + IMAP).');
   } else {
-    console.log('[runOtpCheck] prerequisites OK — running Layer 3 (AJAX trigger + IMAP)...');
+    console.log(`[runOtpCheck] prerequisites OK — running Layer 3 via '${prereq.otpProvider}' provider (AJAX trigger + IMAP)...`);
     record.layer3Attempted = true;
     try {
       const ajaxUrl = `${String(site.url).replace(/\/$/, '')}/wp-admin/admin-ajax.php`;
-      const l3 = await runOtpCheck({ ajaxUrl });
+      const l3 = await runOtpCheck({ ajaxUrl, provider: prereq.otpProvider, apiKey: site.apiKey });
       record.popupAppeared = l3.popupAppeared;
       record.popupError = l3.popupError;
       record.emailFound = l3.emailFound;

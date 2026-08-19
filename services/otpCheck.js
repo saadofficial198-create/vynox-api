@@ -72,13 +72,35 @@ function isImunify360Block(errorMessage) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// AJAX action name per OTP provider (see services/otpLayers.js for how the
+// provider is detected from a site's plugin list):
+//   'legacy' — the "WooCommerce Email OTP Verification" plugin's own
+//              `send_otp` action, which needs no nonce/cart/session.
+//   'vynox'  — our own vynox-checkout/vynox-commerce plugin. Its real
+//              `vynox_request_otp` action requires a checkout-page nonce
+//              and a non-empty WooCommerce cart (both tied to an actual
+//              browser session, unlike 'legacy' — see the plugin's
+//              class-otp.php), so it added a monitoring-only
+//              `vynox_otp_monitor_check` action instead, gated by the
+//              site's own `apiKey` (X-Vynox-Key header) rather than a
+//              nonce/cart.
+function actionNameFor(provider) {
+  return provider === 'vynox' ? 'vynox_otp_monitor_check' : 'send_otp';
+}
+
 /**
- * One attempt at calling the plugin's send_otp AJAX endpoint. Returns
+ * One attempt at calling the plugin's send-OTP AJAX endpoint. Returns
  * { ok, triggeredAt, popupError } — never throws (network errors are
  * captured into popupError, same as before).
  */
-async function attemptSendOtp(ajaxUrl, email) {
+async function attemptSendOtp(ajaxUrl, email, provider, apiKey) {
   const triggeredAt = new Date();
+  const action = actionNameFor(provider);
+
+  if (provider === 'vynox' && !apiKey) {
+    return { ok: false, triggeredAt, popupError: 'vynox provider requires the site\'s own apiKey (sent as X-Vynox-Key) but none was provided' };
+  }
+
   try {
     const headers = {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -90,9 +112,15 @@ async function attemptSendOtp(ajaxUrl, email) {
     if (process.env.OTP_MONITOR_SECRET) {
       headers['X-Vynox-Bot'] = process.env.OTP_MONITOR_SECRET;
     }
+    // 'vynox' provider's monitoring action authenticates with the site's
+    // own connector API key instead of a checkout nonce/cart — see the
+    // comment on actionNameFor above.
+    if (provider === 'vynox') {
+      headers['X-Vynox-Key'] = apiKey;
+    }
     const res = await axios.post(
       ajaxUrl,
-      new URLSearchParams({ action: 'send_otp', email }).toString(),
+      new URLSearchParams({ action, email }).toString(),
       {
         headers,
         timeout: REQUEST_TIMEOUT_MS,
@@ -104,18 +132,23 @@ async function attemptSendOtp(ajaxUrl, email) {
     if (ok) return { ok: true, triggeredAt, popupError: null };
 
     const serverMsg = res.data?.data?.message || JSON.stringify(res.data);
-    return { ok: false, triggeredAt, popupError: `send_otp AJAX call did not report success (HTTP ${res.status}): ${serverMsg}` };
+    return { ok: false, triggeredAt, popupError: `${action} AJAX call did not report success (HTTP ${res.status}): ${serverMsg}` };
   } catch (e) {
-    return { ok: false, triggeredAt, popupError: `send_otp AJAX call failed: ${e.message}` };
+    return { ok: false, triggeredAt, popupError: `${action} AJAX call failed: ${e.message}` };
   }
 }
 
 /**
  * Triggers the OTP send by calling the plugin's own AJAX endpoint directly,
  * then verifies the email actually arrived via IMAP.
- * @param {{ ajaxUrl: string }} opts - ajaxUrl: that site's own
- *   "{url}/wp-admin/admin-ajax.php" — every site provides its own, so this
- *   function has no knowledge of which site it's checking.
+ * @param {{ ajaxUrl: string, provider?: 'legacy'|'vynox', apiKey?: string }} opts
+ *   - ajaxUrl: that site's own "{url}/wp-admin/admin-ajax.php" — every site
+ *     provides its own, so this function has no knowledge of which site
+ *     it's checking.
+ *   - provider: which plugin's AJAX contract to use (see actionNameFor
+ *     above); defaults to 'legacy' for back-compat with existing callers.
+ *   - apiKey: required when provider is 'vynox' — that site's own connector
+ *     API key (Site.apiKey), sent as X-Vynox-Key.
  * @returns {Promise<{
  *   triggeredAt: Date,
  *   popupAppeared: boolean,   // kept for schema/back-compat with OtpCheck model — true means "trigger call succeeded" (no popup involved anymore)
@@ -126,14 +159,14 @@ async function attemptSendOtp(ajaxUrl, email) {
  *   otpCode: string|null,
  * }>}
  */
-export async function runOtpCheck({ ajaxUrl }) {
+export async function runOtpCheck({ ajaxUrl, provider = 'legacy', apiKey }) {
   if (!ajaxUrl) {
     throw new Error('runOtpCheck requires { ajaxUrl } — the target site\'s own admin-ajax.php URL');
   }
 
   const email = process.env.OTP_TEST_EMAIL;
   if (!email) {
-    throw new Error('OTP_TEST_EMAIL is not set — required as the target email for the send_otp AJAX call and the IMAP mailbox to poll');
+    throw new Error('OTP_TEST_EMAIL is not set — required as the target email for the send-OTP AJAX call and the IMAP mailbox to poll');
   }
 
   const result = {
@@ -146,16 +179,16 @@ export async function runOtpCheck({ ajaxUrl }) {
     otpCode: null,
   };
 
-  let attempt = await attemptSendOtp(ajaxUrl, email);
+  let attempt = await attemptSendOtp(ajaxUrl, email, provider, apiKey);
 
   // Retry once for failures that look like a transient hiccup on the
   // SITE's own end (e.g. its wp_mail() call briefly failing) rather than a
   // hard block. Imunify360 blocks skip the retry entirely — see the
   // reasoning above SEND_OTP_RETRY_DELAY_MS.
   if (!attempt.ok && !isImunify360Block(attempt.popupError)) {
-    console.log(`[otpCheck] send_otp failed on first attempt (${attempt.popupError}) — retrying once in ${SEND_OTP_RETRY_DELAY_MS / 1000}s...`);
+    console.log(`[otpCheck] ${actionNameFor(provider)} failed on first attempt (${attempt.popupError}) — retrying once in ${SEND_OTP_RETRY_DELAY_MS / 1000}s...`);
     await sleep(SEND_OTP_RETRY_DELAY_MS);
-    attempt = await attemptSendOtp(ajaxUrl, email);
+    attempt = await attemptSendOtp(ajaxUrl, email, provider, apiKey);
   }
 
   result.triggeredAt = attempt.triggeredAt;

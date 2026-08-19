@@ -11,6 +11,11 @@ const OtpCheckSchema = new mongoose.Schema(
     // Layer 1 — plugin active/inactive, read straight from the most recent
     // Snapshot's data.plugins.plugins list. null = plugin not found at all.
     otpPluginActive:  { type: Boolean, default: null },
+    // Which plugin's AJAX contract Layer 3 used, when otpPluginActive is
+    // true — see services/otpLayers.js/otpCheck.js. null whenever
+    // otpPluginActive isn't true (no OTP plugin active to pick a provider
+    // from).
+    otpProvider:      { type: String, enum: ['legacy', 'vynox', null], default: null },
     smtpPluginActive: { type: Boolean, default: null },
 
     // Layer 2 — WP Mail SMTP actually configured, from data.mail_smtp.

@@ -14,6 +14,8 @@ import screenshotsRouter from './routes/screenshots.js';
 import scanRouter from './routes/scan.js';
 import otpCheckRouter from './routes/otpCheck.js';
 import urlCheckRouter from './routes/urlCheck.js';
+import authRouter from './routes/auth.js';
+import { requireAuth } from './middleware/requireAuth.js';
 import Site from './models/Site.js';
 import JobLock from './models/JobLock.js';
 import { checkAllSitesPageSpeed } from './services/pagespeed.js';
@@ -36,6 +38,11 @@ const MONGO_URI   = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/vynox';
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || 'http://localhost:5174').split(',').map(s => s.trim());
 
 const app = express();
+// Needed for req.ip to reflect the real client IP (see routes/auth.js's
+// login-attempt logging + rate limiting) rather than cPanel's own
+// LiteSpeed reverse-proxy address — Express only trusts X-Forwarded-For
+// when explicitly told to.
+app.set('trust proxy', true);
 app.use(cors({ origin: CORS_ORIGIN, credentials: false }));
 app.use(express.json({ limit: '2mb' }));
 
@@ -48,16 +55,25 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-app.use('/api/sites', sitesRouter);
-app.use('/api/alerts', alertsRouter);
-app.use('/api/updates', updatesRouter);
-app.use('/api/scans', scansRouter);
-app.use('/api/backups', backupsRouter);
-app.use('/api/pagespeed', pagespeedRouter);
-app.use('/api/screenshots', screenshotsRouter);
+// Login itself obviously can't require being already logged in.
+app.use('/api/auth', authRouter);
+
+// Every other browser-facing route requires a valid dashboard session (see
+// middleware/requireAuth.js) — without this, the PIN/password login screen
+// would just be decoration: anyone could still call these endpoints
+// directly and get the same data. /api/scan (GitHub Actions' own
+// X-Scan-Secret) is deliberately NOT gated here — that's machine-to-machine
+// automation with its own separate secret, not a browser session.
+app.use('/api/sites', requireAuth, sitesRouter);
+app.use('/api/alerts', requireAuth, alertsRouter);
+app.use('/api/updates', requireAuth, updatesRouter);
+app.use('/api/scans', requireAuth, scansRouter);
+app.use('/api/backups', requireAuth, backupsRouter);
+app.use('/api/pagespeed', requireAuth, pagespeedRouter);
+app.use('/api/screenshots', requireAuth, screenshotsRouter);
 app.use('/api/scan', scanRouter);
-app.use('/api/otp-check', otpCheckRouter);
-app.use('/api/url-check', urlCheckRouter);
+app.use('/api/otp-check', requireAuth, otpCheckRouter);
+app.use('/api/url-check', requireAuth, urlCheckRouter);
 
 app.use((err, _req, res, _next) => {
   console.error('[ERR]', err);

@@ -277,11 +277,34 @@ const MAX_RUN_MS = 25 * 60 * 1000;
  * the (potentially multi-minute) discovery phase. Sites can have thousands
  * of pages, so the whole thing can legitimately take minutes.
  */
+// Mongoose refuses a second save() on the same document instance while an
+// earlier one is still in flight ("Can't save() the same doc multiple times
+// in parallel"). This run has MANY places that want to persist progress —
+// discovery's onProgress fires once per crawl batch (which on a fast site
+// can happen many times in quick succession), and the scan loop below has
+// several concurrent workers each wanting to persist periodically. None of
+// those callers await each other, so without this, two progress-saves could
+// easily overlap (confirmed live: a crawl that found pages quickly hit
+// exactly this error a few dozen batches in). Chaining every save through
+// the same promise — each one only starts once the previous has actually
+// finished — makes save() calls from anywhere in this function safe to fire
+// without the caller needing to coordinate with any other caller.
+function makeSerialSaver(doc) {
+  let chain = Promise.resolve();
+  return () => {
+    chain = chain.then(() => doc.save()).catch((e) => {
+      console.error('[urlCheck] doc.save() failed:', e.message);
+    });
+    return chain;
+  };
+}
+
 export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } = {}) {
   const deadlineTs = Date.now() + MAX_RUN_MS;
+  const saveDoc = makeSerialSaver(doc);
 
   doc.phase = 'discovering';
-  await doc.save();
+  await saveDoc();
 
   let sinceLastDiscoverySave = 0;
   const { urls, truncated: discoveryTruncated, sources } = await discoverAllPages(site, {
@@ -294,7 +317,7 @@ export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } 
       // crawl could otherwise be dozens of writes in quick succession.
       if (++sinceLastDiscoverySave >= 5) {
         sinceLastDiscoverySave = 0;
-        doc.save().catch(() => {});
+        saveDoc();
       }
     },
   });
@@ -304,7 +327,7 @@ export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } 
   doc.totalPages = urls.length;
   doc.discoverySources = sources;
   doc.scannedPages = 0;
-  await doc.save();
+  await saveDoc();
 
   const matches = [];
   let scanned = 0;
@@ -326,8 +349,8 @@ export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } 
     // hammer MongoDB for no real benefit to the polling UI.
     if (sinceLastSave >= 15 || scanned === urls.length) {
       doc.scannedPages = scanned;
-      await doc.save().catch(() => {});
       sinceLastSave = 0;
+      await saveDoc();
     }
   });
 
@@ -337,6 +360,6 @@ export async function runUrlCheck(doc, site, oldDomain, { scanConcurrency = 6 } 
   doc.phase = null;
   doc.status = 'completed';
   doc.finishedAt = new Date();
-  await doc.save();
+  await saveDoc();
   return doc;
 }

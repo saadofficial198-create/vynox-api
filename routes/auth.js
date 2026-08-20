@@ -2,7 +2,17 @@ import express from 'express';
 import crypto from 'crypto';
 import Session from '../models/Session.js';
 import LoginAttempt from '../models/LoginAttempt.js';
-import { requireAuth } from '../middleware/requireAuth.js';
+import { requireAuth, getSessionToken, SESSION_COOKIE_NAME } from '../middleware/requireAuth.js';
+
+// vynox-react (Vercel) and this API (cPanel) are different origins, so the
+// session cookie MUST be SameSite=None + Secure to be sent at all on
+// cross-site requests — browsers silently drop it otherwise. No Max-Age/
+// Expires is set anywhere this cookie is written, which is what makes it a
+// true "session cookie": shared across every tab of the browser while it's
+// open, gone the moment the browser application itself is closed (not just
+// a tab) — see middleware/requireAuth.js's longer comment for why this
+// replaced an earlier sessionStorage-based version.
+const COOKIE_OPTS = { httpOnly: true, secure: true, sameSite: 'none', path: '/' };
 
 const router = express.Router();
 
@@ -68,19 +78,32 @@ router.post('/login', async (req, res) => {
     userAgent,
   });
 
-  res.json({ ok: true, token, expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString() });
+  // Not returned in the JSON body — HttpOnly means the browser stores it
+  // but JavaScript (this API response included) never gets to touch the
+  // actual value again. The frontend doesn't need it: every future request
+  // just needs credentials:'include' for the browser to attach the cookie
+  // automatically (see src/api.js).
+  res.cookie(SESSION_COOKIE_NAME, token, COOKIE_OPTS);
+  res.json({ ok: true });
 });
 
-// POST /api/auth/logout — body: {} (token comes from the Authorization
-// header, same as every other protected route). Explicit logout deletes
-// the session immediately rather than waiting for its TTL to expire, so a
-// shared/public computer can't be logged out of just by closing the tab
-// (sessionStorage would already do that) — this also invalidates the token
-// itself server-side, in case it was copied somewhere.
+// POST /api/auth/logout — deletes the session server-side immediately
+// (rather than waiting for its TTL to expire) so a shared/public computer
+// can be logged out of on purpose, not just by fully closing the browser —
+// and clears the cookie so the browser stops sending the now-dead token.
 router.post('/logout', requireAuth, async (req, res) => {
-  const header = req.get('Authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+  const token = getSessionToken(req);
   if (token) await Session.deleteOne({ token });
+  res.clearCookie(SESSION_COOKIE_NAME, COOKIE_OPTS);
+  res.json({ ok: true });
+});
+
+// GET /api/auth/me — lightweight "is my session still valid?" check.
+// requireAuth already does 100% of the real work (401s if not); this
+// route's own body only runs at all once that's passed. AuthGate calls
+// this on load to decide login-screen vs. dashboard, since an HttpOnly
+// cookie can't be read from JS to check locally.
+router.get('/me', requireAuth, (_req, res) => {
   res.json({ ok: true });
 });
 

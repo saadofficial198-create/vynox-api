@@ -43,7 +43,12 @@ const app = express();
 // LiteSpeed reverse-proxy address — Express only trusts X-Forwarded-For
 // when explicitly told to.
 app.set('trust proxy', true);
-app.use(cors({ origin: CORS_ORIGIN, credentials: false }));
+// credentials: true — required for the browser to send/accept the session
+// cookie (see routes/auth.js) on cross-origin requests between vynox-react
+// (Vercel) and this API (cPanel). Only safe alongside a specific,
+// non-wildcard CORS_ORIGIN allowlist (which this already is) — the `cors`
+// package refuses to combine credentials with `origin: '*'` anyway.
+app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/health', (_req, res) => {

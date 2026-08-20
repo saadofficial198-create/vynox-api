@@ -8,6 +8,8 @@ import OtpCheck from '../models/OtpCheck.js';
 import Alert from '../models/Alert.js';
 import { detectMonitoredPages, detectSitemapCandidates } from '../services/sitemapDetect.js';
 import { deriveHealthStatus } from '../services/healthStatus.js';
+import { scanOneSite } from '../services/scanAllSites.js';
+import { syncAlertsForSite } from './alerts.js';
 
 const router = express.Router();
 
@@ -340,12 +342,32 @@ router.delete('/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-// NOTE: the old manual "POST /:id/sync" + "GET /:id/sync/status" endpoints
-// (and the syncJobs in-memory tracker) are gone. Security-data syncing is no
-// longer a manually-triggered, per-site action — it now runs automatically
-// once a day for every site via services/scanAllSites.js, triggered by the
-// GitHub Actions workflow .github/workflows/daily-scan.yml hitting the
-// protected POST /api/scan/run-all endpoint (see routes/scan.js).
+// POST /api/sites/:id/sync — manual on-demand re-sync for ONE site, for the
+// "Sync Now" row action in the Sites list (instead of waiting for the next
+// automated hourly scan — see .github/workflows/daily-scan.yml /
+// routes/scan.js's /run-all, which still runs unattended for every site
+// regardless). Reuses the exact same scanOneSite()/syncAlertsForSite() the
+// automated scan uses, just for a single site.
+//
+// Kept SYNCHRONOUS (unlike /run-all, which responds immediately and scans
+// in the background) — a single site's connector call is capped at 60s
+// (see callConnector's timeout below), nowhere near cPanel's ~2min
+// LiteSpeed proxy timeout that made looping over EVERY site synchronously
+// unsafe. Awaiting here means the button can show a spinner and land
+// exactly on "done" without needing a separate polling endpoint.
+router.post('/:id/sync', async (req, res) => {
+  const site = await Site.findById(req.params.id);
+  if (!site) return res.status(404).json({ ok: false, error: 'Site not found' });
+
+  try {
+    const { snap } = await scanOneSite(site);
+    const freshSite = await Site.findById(site._id).lean();
+    await syncAlertsForSite(freshSite, snap).catch((e) => console.error('[sites] sync: alert sync failed:', e.message));
+    res.json({ ok: true, site: freshSite, snapshot: snap });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // GET /api/sites/:id/latest — most recent snapshot
 router.get('/:id/latest', async (req, res) => {

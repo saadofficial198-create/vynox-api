@@ -26,10 +26,12 @@ function hostFromUrl(url) {
 }
 
 // scanOneSite(site) — pulls /wp-json/vynox/v1/data for one site, stores a
-// Snapshot, and updates Site.latest/status. This replaces what the old
-// POST /:id/sync HTTP endpoint used to do, minus the manual-trigger part.
+// Snapshot, and updates Site.latest/status. Used by scanAllSites() below
+// (the automated hourly scan) AND by routes/sites.js's manual per-site
+// POST /:id/sync (the "Sync Now" row action) — exported so that route can
+// reuse the exact same logic instead of duplicating it.
 // Returns { site, snap, wentOffline } so the caller can decide about emails.
-async function scanOneSite(site) {
+export async function scanOneSite(site) {
   const wasOnline = site.status === 'online' || site.status === 'unknown';
   let snap = null;
   let wentOffline = false;

@@ -4,6 +4,7 @@
 .env.*
 !.env.example
 README.md
+Imunify360_Allowlist_Guide.md
 
 # Dependencies — reinstalled via package.json, no need to version them
 node_modules/

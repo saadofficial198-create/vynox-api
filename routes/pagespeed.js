@@ -86,6 +86,40 @@ router.get('/:siteId/status', (req, res) => {
   res.json({ ok: true, checking: runningSites.has(`${req.params.siteId}:${strategy}`) });
 });
 
+// GET /api/pagespeed/latest-all?strategy=mobile|desktop — every site's Home
+// page latest score, in ONE response. Exists purely to fix a scaling
+// problem: Dashboard.jsx/Sites.jsx/Scans.jsx each poll EVERY site's
+// Home-page score every 30s via perfScore.js's resolveHomePerfScore, which
+// used to mean one GET /:siteId/latest call per site per strategy — at 47
+// sites that's 94 individual requests every 30 seconds. Each one also needs
+// its own CORS preflight (this API requires credentials for the session
+// cookie), and the browser's ~6-connections-per-origin cap turned that pile
+// of requests into a queue backing up 10+ seconds per request (confirmed
+// live in the Network tab — every request showing ~14s despite the backend
+// itself responding fast). One request per strategy fixes this regardless
+// of how many sites get added later.
+router.get('/latest-all', async (req, res) => {
+  const strategy = req.query.strategy === 'desktop' ? 'desktop' : 'mobile';
+  const sites = await Site.find().select('_id').lean();
+  if (!sites.length) return res.json({ ok: true, strategy, scores: {} });
+
+  // Only Home's score is needed here — the other monitored pages' scores
+  // are only ever shown inside a single site's own Performance tab (one
+  // site at a time, no scaling problem there).
+  const latestPerSite = await PageSpeedResult.aggregate([
+    { $match: { site: { $in: sites.map(s => s._id) }, pageLabel: 'Home', strategy } },
+    { $sort: { checkedAt: -1 } },
+    { $group: { _id: '$site', latest: { $first: '$$ROOT' } } },
+  ]);
+
+  const bySite = new Map(latestPerSite.map(r => [String(r._id), r.latest]));
+  const scores = {};
+  for (const site of sites) {
+    scores[String(site._id)] = bySite.get(String(site._id)) || null;
+  }
+  res.json({ ok: true, strategy, scores });
+});
+
 // GET /api/pagespeed/:siteId/latest?strategy=mobile|desktop — latest result
 // per monitored page, for ONE strategy (default 'mobile' for backward
 // compatibility with the frontend/older callers). Includes disabled/

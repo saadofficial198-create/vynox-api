@@ -48,7 +48,14 @@ app.set('trust proxy', true);
 // (Vercel) and this API (cPanel). Only safe alongside a specific,
 // non-wildcard CORS_ORIGIN allowlist (which this already is) — the `cors`
 // package refuses to combine credentials with `origin: '*'` anyway.
-app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+// maxAge: without it, the `cors` package sends no Access-Control-Max-Age at
+// all, so the browser re-runs a full CORS preflight (OPTIONS round-trip)
+// before literally every single request, forever — confirmed live as a big
+// contributor to page loads stalling for many seconds once there were
+// enough sites to fire many requests at once (see routes/pagespeed.js's
+// /latest-all comment for the fuller story). 600s means a repeat call to
+// the same-shaped endpoint within 10 minutes skips the preflight entirely.
+app.use(cors({ origin: CORS_ORIGIN, credentials: true, maxAge: 600 }));
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/health', (_req, res) => {

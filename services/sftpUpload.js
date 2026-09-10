@@ -138,22 +138,38 @@ export async function deleteScreenshot(relativePath) {
  * pages x 2 captures/day, accumulated over 31 days). Calling
  * deleteScreenshot() in a loop would open/close a brand new FTP session
  * per file, which is slow and needlessly hammers the FTP server; this
- * reuses one connection for the whole batch instead. One file failing
- * (already gone, transient error) doesn't stop the rest.
+ * reuses one connection for the whole batch instead.
+ *
+ * One file failing to delete doesn't stop the rest — BUT unlike the
+ * earlier version of this function, failures are no longer silently
+ * swallowed: they're logged and returned, so a real problem (wrong path,
+ * permissions, the shared connection dying partway through a big batch)
+ * shows up instead of just leaving orphaned files on cPanel forever with
+ * no visible trace anywhere.
+ *
+ * @returns {Promise<{ succeeded: number, failed: { relativePath: string, error: string }[] }>}
  */
 export async function deleteScreenshots(relativePaths) {
-  if (!relativePaths.length) return;
+  const result = { succeeded: 0, failed: [] };
+  if (!relativePaths.length) return result;
+
   const { client, remoteBase } = await connect();
   try {
     for (const relativePath of relativePaths) {
       try {
         const remoteFile = path.posix.join(remoteBase, relativePath);
         await client.remove(remoteFile);
-      } catch {
-        // already gone or never existed — fine, keep going with the rest
+        result.succeeded++;
+      } catch (e) {
+        // A "550 file not found" here is fine (already gone) — but we still
+        // can't tell that apart from a real failure (wrong path, dead
+        // connection, permissions) without the message, so it's reported
+        // either way; the caller decides whether that's worth surfacing.
+        result.failed.push({ relativePath, error: e.message });
       }
     }
   } finally {
     client.close();
   }
+  return result;
 }

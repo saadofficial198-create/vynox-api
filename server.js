@@ -267,7 +267,7 @@ async function screenshotCleanupJob() {
 
   try {
     const result = await cleanupOldScreenshots();
-    console.log(`[screenshot-cleanup] run complete: found ${result.found} screenshot(s) older than ${SCREENSHOT_RETENTION_DAYS} days, deleted ${result.deleted}`);
+    console.log(`[screenshot-cleanup] run complete: found ${result.found} screenshot(s) older than ${SCREENSHOT_RETENTION_DAYS} days — DB: ${result.dbDeleted} deleted, FTP: ${result.ftpDeleted} deleted / ${result.ftpFailed.length} failed / ${result.noRelativePath} had no stored path`);
   } catch (e) {
     console.error('[screenshot-cleanup] run failed:', e.message);
   } finally {

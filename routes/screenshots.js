@@ -2,8 +2,26 @@ import express from 'express';
 import Site from '../models/Site.js';
 import Screenshot from '../models/Screenshot.js';
 import { triggerGithubWorkflow } from '../services/githubTrigger.js';
+import { cleanupOldScreenshots, SCREENSHOT_RETENTION_DAYS } from '../services/screenshotRetention.js';
 
 const router = express.Router();
+
+// POST /api/screenshots/cleanup-now — runs the 31-day retention cleanup
+// (see services/screenshotRetention.js) immediately and returns the full
+// result, instead of waiting for server.js's own daily job and having to
+// dig through cPanel's Node app logs to see what happened. Meant as a
+// diagnostic/manual-trigger tool (e.g. confirming old screenshots are
+// actually being found and deleted, or seeing exactly which FTP deletes
+// failed and why) — the daily background job still runs on its own
+// regardless of whether this is ever called.
+router.post('/cleanup-now', async (_req, res) => {
+  try {
+    const result = await cleanupOldScreenshots();
+    res.json({ ok: true, retentionDays: SCREENSHOT_RETENTION_DAYS, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // POST /api/screenshots/capture-all — asks GitHub Actions to run the
 // screenshot workflow right now (in addition to its 2x/day schedule).

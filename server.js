@@ -15,6 +15,7 @@ import screenshotsRouter from './routes/screenshots.js';
 import scanRouter from './routes/scan.js';
 import otpCheckRouter from './routes/otpCheck.js';
 import urlCheckRouter from './routes/urlCheck.js';
+import badgesRouter from './routes/badges.js';
 import authRouter from './routes/auth.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import Site from './models/Site.js';
@@ -99,6 +100,7 @@ app.use('/api/screenshots', requireAuth, screenshotsRouter);
 app.use('/api/scan', scanRouter);
 app.use('/api/otp-check', requireAuth, otpCheckRouter);
 app.use('/api/url-check', requireAuth, urlCheckRouter);
+app.use('/api/badges', requireAuth, badgesRouter);
 
 app.use((err, _req, res, _next) => {
   console.error('[ERR]', err);

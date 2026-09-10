@@ -238,6 +238,33 @@ router.get('/:id', async (req, res) => {
   res.json({ ok: true, site });
 });
 
+// PUT /api/sites/:id — edits a site's own name and/or its badge (the Sites
+// list's "Edit" row action). `tags` is stored as a single-item array (or
+// empty) even though the schema allows any number of strings — the Edit
+// modal only offers ONE badge via a single-select dropdown; the array
+// shape is kept as-is rather than narrowed to a plain string so this
+// doesn't require a data migration if multi-badge support is ever added
+// later. An empty/omitted badge clears it (site.tags = []).
+router.put('/:id', async (req, res) => {
+  const { name, badge } = req.body || {};
+  const update = {};
+  if (typeof name === 'string') {
+    const trimmed = name.trim();
+    if (!trimmed) return res.status(400).json({ ok: false, error: 'name cannot be empty' });
+    update.name = trimmed;
+  }
+  if (badge !== undefined) {
+    update.tags = badge ? [String(badge)] : [];
+  }
+  if (!Object.keys(update).length) {
+    return res.status(400).json({ ok: false, error: 'Nothing to update' });
+  }
+
+  const site = await Site.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).lean();
+  if (!site) return res.status(404).json({ ok: false, error: 'Site not found' });
+  res.json({ ok: true, site });
+});
+
 // DELETE /api/sites/:id — removes the site AND every collection that
 // references it (Snapshot, Screenshot records, PageSpeedResult, OtpCheck,
 // Alert). Previously this only deleted Snapshot, leaving the other four

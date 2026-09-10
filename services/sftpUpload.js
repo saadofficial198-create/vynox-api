@@ -118,7 +118,7 @@ export async function downloadScreenshot(relativePath) {
   }
 }
 
-/** Deletes a previously uploaded screenshot from cPanel. Used for retention cleanup later, if needed. */
+/** Deletes a previously uploaded screenshot from cPanel. */
 export async function deleteScreenshot(relativePath) {
   const { client, remoteBase } = await connect();
   try {
@@ -126,6 +126,33 @@ export async function deleteScreenshot(relativePath) {
     await client.remove(remoteFile);
   } catch {
     // already gone or never existed — fine
+  } finally {
+    client.close();
+  }
+}
+
+/**
+ * Deletes many previously uploaded screenshots over a SINGLE FTP connection
+ * — used by services/screenshotRetention.js's monthly cleanup, which can
+ * easily need to remove hundreds of files at once (many sites x multiple
+ * pages x 2 captures/day, accumulated over 31 days). Calling
+ * deleteScreenshot() in a loop would open/close a brand new FTP session
+ * per file, which is slow and needlessly hammers the FTP server; this
+ * reuses one connection for the whole batch instead. One file failing
+ * (already gone, transient error) doesn't stop the rest.
+ */
+export async function deleteScreenshots(relativePaths) {
+  if (!relativePaths.length) return;
+  const { client, remoteBase } = await connect();
+  try {
+    for (const relativePath of relativePaths) {
+      try {
+        const remoteFile = path.posix.join(remoteBase, relativePath);
+        await client.remove(remoteFile);
+      } catch {
+        // already gone or never existed — fine, keep going with the rest
+      }
+    }
   } finally {
     client.close();
   }

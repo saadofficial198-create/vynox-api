@@ -21,6 +21,7 @@ import { requireAuth } from './middleware/requireAuth.js';
 import Site from './models/Site.js';
 import JobLock from './models/JobLock.js';
 import { checkAllSitesPageSpeed } from './services/pagespeed.js';
+import { cleanupOldScreenshots, SCREENSHOT_RETENTION_DAYS } from './services/screenshotRetention.js';
 // NOTE: screenshot capture (Playwright/Chromium) does NOT run on this cPanel
 // backend anymore — shared cPanel Node.js hosting can't run a headless
 // browser (no system libs, no permission to install Chromium). Captures now
@@ -225,6 +226,58 @@ async function pageSpeedJob() {
   }
 }
 
+// Deletes every Screenshot (MongoDB record + the actual cPanel image file)
+// older than SCREENSHOT_RETENTION_DAYS (31 — "one month"), so the
+// Screenshots tab doesn't grow forever (2 captures/day per monitored page,
+// across every site). Unlike screenshot CAPTURE (forced out to GitHub
+// Actions because this cPanel host can't run Playwright/Chromium — see the
+// NOTE near the top of this file), cleanup only needs MongoDB + a plain FTP
+// connection, both of which this server already does fine, so it runs
+// right here instead of needing a whole separate workflow. Same
+// MongoDB-backed JobLock pattern as pageSpeedJob above, for the same
+// reason: this process restarts often enough (every deploy/env change on
+// cPanel) that a plain in-memory "already running" flag isn't reliable
+// across restarts, and a stale lock left by a process that died mid-run
+// shouldn't block this from ever running again.
+const SCREENSHOT_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once a day is plenty for a 31-day retention window
+const SCREENSHOT_CLEANUP_STALE_LOCK_MS = 30 * 60 * 1000;
+
+async function screenshotCleanupJob() {
+  const key = 'screenshot-cleanup';
+  try {
+    const existing = await JobLock.findOne({ key });
+    const now = Date.now();
+
+    if (existing?.runningSince && now - existing.runningSince.getTime() < SCREENSHOT_CLEANUP_STALE_LOCK_MS) {
+      return console.log('[screenshot-cleanup] another process is already running this, skipping this tick');
+    }
+    if (existing?.lastRunAt && now - existing.lastRunAt.getTime() < SCREENSHOT_CLEANUP_INTERVAL_MS) {
+      return console.log('[screenshot-cleanup] last run was less than 24h ago, skipping this tick');
+    }
+
+    await JobLock.findOneAndUpdate(
+      { key },
+      { $set: { runningSince: new Date() } },
+      { upsert: true }
+    );
+  } catch (e) {
+    console.error('[screenshot-cleanup] lock check failed, skipping this tick to be safe:', e.message);
+    return;
+  }
+
+  try {
+    const result = await cleanupOldScreenshots();
+    console.log(`[screenshot-cleanup] run complete: found ${result.found} screenshot(s) older than ${SCREENSHOT_RETENTION_DAYS} days, deleted ${result.deleted}`);
+  } catch (e) {
+    console.error('[screenshot-cleanup] run failed:', e.message);
+  } finally {
+    await JobLock.findOneAndUpdate(
+      { key: 'screenshot-cleanup' },
+      { $set: { runningSince: null, lastRunAt: new Date() } }
+    ).catch((e) => console.error('[screenshot-cleanup] failed to release lock:', e.message));
+  }
+}
+
 mongoose
   .connect(MONGO_URI)
   .then(() => {
@@ -239,8 +292,11 @@ mongoose
       setInterval(pageSpeedJob, 6 * 60 * 60 * 1000);
       setTimeout(pageSpeedJob, 20000);
 
-      // Screenshots are captured by GitHub Actions on a schedule now, not by
-      // this server — see the NOTE near the top of this file.
+      // Screenshots are CAPTURED by GitHub Actions on a schedule (not by
+      // this server — see the NOTE near the top of this file), but their
+      // 31-day retention CLEANUP runs right here (see screenshotCleanupJob).
+      setInterval(screenshotCleanupJob, SCREENSHOT_CLEANUP_INTERVAL_MS);
+      setTimeout(screenshotCleanupJob, 30000);
     });
   })
   .catch((e) => {

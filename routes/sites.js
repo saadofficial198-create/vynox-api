@@ -7,7 +7,6 @@ import PageSpeedResult from '../models/PageSpeedResult.js';
 import OtpCheck from '../models/OtpCheck.js';
 import Alert from '../models/Alert.js';
 import { detectMonitoredPages, detectSitemapCandidates } from '../services/sitemapDetect.js';
-import { deriveHealthStatus } from '../services/healthStatus.js';
 import { scanOneSite } from '../services/scanAllSites.js';
 import { syncAlertsForSite } from './alerts.js';
 
@@ -51,90 +50,12 @@ router.post('/test', async (req, res) => {
 });
 
 // POST /api/sites/register — plugin self-registration (no manual copy/paste).
-// Plugin sends { url, apiKey, secret }. We verify the shared enrollment secret,
-// confirm the key works via /ping, then upsert the site (re-registering is safe).
-router.post('/register', async (req, res) => {
-  const { url, apiKey, secret, name } = req.body || {};
-  const expected = process.env.VYNOX_ENROLL_SECRET;
-
-  if (!expected) {
-    return res.status(500).json({ ok: false, error: 'Server enrollment secret not configured' });
-  }
-  if (!secret || secret !== expected) {
-    return res.status(401).json({ ok: false, error: 'Invalid enrollment secret' });
-  }
-  if (!url || !apiKey) {
-    return res.status(400).json({ ok: false, error: 'url and apiKey are required' });
-  }
-
-  const cleaned = cleanUrl(url);
-  try {
-    // Pure instant DB write — the shared secret already proves authenticity.
-    // No network call here, so the plugin always gets a fast 200 (no timeouts).
-    const site = await Site.findOneAndUpdate(
-      { url: cleaned },
-      {
-        $set: { apiKey, status: 'unknown', lastCheckedAt: new Date() },
-        // Only applied on a genuinely NEW site (upsert insert), never on a
-        // re-registration of an existing one — so this doesn't clobber a
-        // site's real, already-saved monitoredPages/pagesConfigured. Home
-        // ('/') is seeded immediately and enabled for capture right away
-        // (see POST / above for why: it's never a guessed slug, so there's
-        // no reason to gate it behind manual Settings review like
-        // Shop/Contact Us/Track Order are).
-        $setOnInsert: {
-          name: name || cleaned,
-          tags: [],
-          notes: '',
-          monitoredPages: [{ label: 'Home', path: '/', enabled: true, matchStatus: 'ok' }],
-          pagesConfigured: true,
-        },
-      },
-      { new: true, upsert: true }
-    );
-
-    res.json({ ok: true, site });
-
-    // Everything network-bound happens in the BACKGROUND, after the reply:
-    // ping (mark online + versions) then full data pull (snapshot + summary).
-    (async () => {
-      try {
-        const ping = await callConnector(cleaned, apiKey, '/ping');
-        if (ping.status === 200 && ping.data?.ok) {
-          site.status = 'online';
-          site.lastCheckedAt = new Date();
-          site.connectorVersion = ping.data.connector_version || null;
-          site.wpVersion = ping.data.wp_version || null;
-          if (ping.data.site_name && site.name === cleaned) site.name = ping.data.site_name;
-          await site.save();
-        }
-        const r = await callConnector(cleaned, apiKey, '/data', 30000);
-        if (r.status === 200) {
-          await Snapshot.create({ site: site._id, ok: true, data: r.data });
-          site.status = 'online';
-          site.lastSyncedAt = new Date();
-          site.latest = deriveHealthStatus(r.data);
-          site.markModified('latest');
-          await site.save();
-        }
-      } catch { /* registration already succeeded; ignore background errors */ }
-
-      // NOTE: we deliberately do NOT auto-apply detectMonitoredPages() (the
-      // Shop/Contact Us/Track Order guesses) here — those guessed slugs are
-      // frequently wrong, and running against a wrong/404 page is exactly
-      // the silent-garbage-data problem this feature exists to avoid. The
-      // user must explicitly open Settings, review the live sitemap-detected
-      // page candidates (GET /:id/page-candidates), and save their
-      // selection (PUT /:id/monitored-pages) to add anything beyond Home.
-      // Home itself, however, IS seeded automatically above ($setOnInsert)
-      // and pagesConfigured starts true — Home is never a guess (always
-      // "/"), so capture starts on it immediately without waiting on a
-      // human to open Settings.
-    })();
-  } catch (e) {
-    res.status(502).json({ ok: false, error: e.message });
-  }
-});
+// POST /register moved to routes/sitesRegister.js — it's the WordPress
+// plugin's own machine-to-machine auto-registration call (its activation
+// hook + daily retry cron), authenticated with VYNOX_ENROLL_SECRET, not a
+// browser session. server.js mounts that router UNGUARDED, separately from
+// this one (which requireAuth protects) — see that file's comment for why
+// it needed to be split out.
 
 // GET /api/sites — list all
 router.get('/', async (_req, res) => {

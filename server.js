@@ -5,6 +5,7 @@ import mongoose from 'mongoose';
 import axios from 'axios';
 import https from 'https';
 import sitesRouter from './routes/sites.js';
+import sitesRegisterRouter from './routes/sitesRegister.js';
 import alertsRouter from './routes/alerts.js';
 import updatesRouter from './routes/updates.js';
 import scansRouter from './routes/scans.js';
@@ -69,6 +70,18 @@ app.get('/api/health', (_req, res) => {
 
 // Login itself obviously can't require being already logged in.
 app.use('/api/auth', authRouter);
+
+// POST /api/sites/register is the WordPress plugin's own auto-registration
+// call (activation hook + daily retry cron in vynox-connector.php) — a
+// plugin has no browser session to send, and authenticates instead with
+// its own VYNOX_ENROLL_SECRET (see routes/sitesRegister.js). Mounted here,
+// UNGUARDED and BEFORE the requireAuth-gated mount below, so it's handled
+// first for that one path; every other /api/sites/* route still falls
+// through to the guarded mount. Confirmed live: a new site's plugin
+// activation silently stopped auto-registering once this got wrapped in
+// requireAuth along with everything else — that regression is what this
+// split fixes.
+app.use('/api/sites', sitesRegisterRouter);
 
 // Every other browser-facing route requires a valid dashboard session (see
 // middleware/requireAuth.js) — without this, the PIN/password login screen

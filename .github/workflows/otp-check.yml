@@ -26,7 +26,15 @@ on:
 jobs:
   otp-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5 # just an HTTP call + a few IMAP polls now — no browser
+    # Each site that reaches Layer 3 spends up to ~2.5 min mostly waiting
+    # (20s AJAX + up to 120s polling IMAP for the email). runOtpCheck.js
+    # runs several sites concurrently to keep the total down, but the
+    # headroom still has to cover the whole fleet — this was 5 minutes and
+    # a real run got cancelled mid-site once enough sites had a working OTP
+    # plugin. Generous on purpose: the job exits as soon as it's done, so a
+    # high ceiling costs nothing on a normal run and only matters when
+    # something is genuinely slow.
+    timeout-minutes: 20
     steps:
       - name: Check out repo
         uses: actions/checkout@v4

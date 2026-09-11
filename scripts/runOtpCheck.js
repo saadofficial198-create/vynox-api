@@ -184,16 +184,38 @@ async function main() {
   }
   console.log(`[runOtpCheck] checking ${sites.length} site(s) with the OTP monitor enabled...`);
 
+  // Run several sites at once rather than strictly one after another. Each
+  // site that actually reaches Layer 3 spends up to ~2.5 minutes almost
+  // entirely WAITING — 20s for the AJAX call, then up to 120s polling IMAP
+  // for the email to arrive (see services/imapCheck.js's POLL_TOTAL_MS).
+  // Sequentially that put the whole run at 2.5 minutes PER eligible site,
+  // which blew past the workflow's timeout once more than a couple of sites
+  // had a working OTP plugin — confirmed live: the run was cancelled
+  // mid-site at the 5-minute mark.
+  //
+  // Capped rather than unbounded: every site's Layer 3 opens its own IMAP
+  // connection to the SAME mailbox, and mail servers limit concurrent IMAP
+  // connections per account (commonly ~10-15, and cPanel/Dovecot rejects
+  // the excess outright rather than queueing). A modest cap stays well
+  // under that while still cutting total runtime by roughly this factor.
+  const CONCURRENCY = 5;
+
   let anyFailed = false;
-  for (const site of sites) {
-    try {
-      const status = await checkOneSite(site);
-      if (status !== 'pass' && status !== 'not_applicable') anyFailed = true;
-    } catch (e) {
-      console.error(`[runOtpCheck] site ${site._id} (${site.url}) failed unexpectedly:`, e.message);
-      anyFailed = true;
+  const queue = [...sites];
+  const worker = async () => {
+    for (;;) {
+      const site = queue.shift();
+      if (!site) return;
+      try {
+        const status = await checkOneSite(site);
+        if (status !== 'pass' && status !== 'not_applicable') anyFailed = true;
+      } catch (e) {
+        console.error(`[runOtpCheck] site ${site._id} (${site.url}) failed unexpectedly:`, e.message);
+        anyFailed = true;
+      }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, sites.length) }, worker));
 
   await mongoose.disconnect();
 

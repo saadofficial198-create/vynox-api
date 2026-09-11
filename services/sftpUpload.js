@@ -118,6 +118,53 @@ export async function downloadScreenshot(relativePath) {
   }
 }
 
+/**
+ * Moves (renames) many previously uploaded screenshots on cPanel in one
+ * shared FTP connection — used by services/screenshotMigration.js to merge
+ * a site's old, name-derived screenshot folders ("vizkart", "viz-kart", ...
+ * left behind by renames before services/screenshot.js switched to a
+ * site._id-based, permanently stable folder) into its current one. A
+ * server-side rename is a single FTP command — far cheaper than
+ * downloading every file and re-uploading it elsewhere.
+ *
+ * @param {{ from: string, to: string }[]} moves - relativePaths
+ * @returns {Promise<{ succeeded: { from: string, to: string }[], failed: { from: string, to: string, error: string }[] }>}
+ */
+export async function moveScreenshots(moves) {
+  const result = { succeeded: [], failed: [] };
+  if (!moves.length) return result;
+
+  const { client, remoteBase } = await connect();
+  try {
+    // rename() fails if the destination directory doesn't exist yet —
+    // create every distinct target directory up front. ensureDir() also
+    // changes the connection's current directory as a side effect, but
+    // every path used below is absolute, so that doesn't matter.
+    const targetDirs = new Set(moves.map(m => path.posix.dirname(path.posix.join(remoteBase, m.to))));
+    for (const dir of targetDirs) {
+      try {
+        await client.ensureDir(dir);
+      } catch (e) {
+        console.error(`[sftpUpload] failed to create target directory ${dir}:`, e.message);
+      }
+    }
+
+    for (const { from, to } of moves) {
+      try {
+        const fromAbs = path.posix.join(remoteBase, from);
+        const toAbs = path.posix.join(remoteBase, to);
+        await client.rename(fromAbs, toAbs);
+        result.succeeded.push({ from, to });
+      } catch (e) {
+        result.failed.push({ from, to, error: e.message });
+      }
+    }
+  } finally {
+    client.close();
+  }
+  return result;
+}
+
 /** Deletes a previously uploaded screenshot from cPanel. */
 export async function deleteScreenshot(relativePath) {
   const { client, remoteBase } = await connect();

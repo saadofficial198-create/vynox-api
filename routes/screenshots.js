@@ -3,8 +3,25 @@ import Site from '../models/Site.js';
 import Screenshot from '../models/Screenshot.js';
 import { triggerGithubWorkflow } from '../services/githubTrigger.js';
 import { cleanupOldScreenshots, cleanupOrphanedScreenshotFiles, SCREENSHOT_RETENTION_DAYS } from '../services/screenshotRetention.js';
+import { mergeScreenshotFolders } from '../services/screenshotMigration.js';
 
 const router = express.Router();
+
+// POST /api/screenshots/merge-folders-now — one-time migration for the
+// folder-fragmentation bug fixed in services/screenshot.js (a site rename
+// used to create a brand new cPanel screenshot folder instead of reusing
+// the same one). Moves every site's existing screenshots into its current,
+// permanent site._id-based folder — see services/screenshotMigration.js.
+// Safe to run more than once: a site with nothing left in the wrong place
+// is simply skipped.
+router.post('/merge-folders-now', async (_req, res) => {
+  try {
+    const result = await mergeScreenshotFolders();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // POST /api/screenshots/cleanup-now — runs BOTH retention-cleanup passes
 // (see services/screenshotRetention.js) immediately and returns the full

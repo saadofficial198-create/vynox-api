@@ -400,7 +400,19 @@ async function waitForRealPageReady(tab) {
  */
 export async function captureSitePage(browser, site, page) {
   const fullUrl = joinUrl(site.url, page.path);
-  const siteSlug = safeSlug(site.name || site._id);
+  // Always site._id, NEVER site.name — confirmed live: renaming a site (the
+  // Sites list's Edit modal, added recently) used to change this folder for
+  // every capture from then on, since site.name was used first. That left
+  // every past name for the same site as its OWN separate, orphaned cPanel
+  // folder ("vizkart", "viz-kart", "velet-mart", ...), one per rename,
+  // forever. site._id never changes for a site's whole lifetime, so this
+  // folder is now permanently stable regardless of how many times the name
+  // gets edited later. (The stray old name-based folders left behind by
+  // this bug aren't a problem going forward, they just need cleaning up —
+  // see services/screenshotRetention.js's orphan-file pass, which finds
+  // them by filename timestamp, not by folder name, so it doesn't care
+  // that they're not attached to any site.)
+  const siteSlug = safeSlug(site._id);
   const pageSlug = safeSlug(page.label);
   const fileName = `${pageSlug}-${Date.now()}.jpg`;
   const relativePath = `${siteSlug}/${fileName}`;

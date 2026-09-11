@@ -1,5 +1,5 @@
 import Screenshot from '../models/Screenshot.js';
-import { deleteScreenshots } from './sftpUpload.js';
+import { deleteScreenshots, listAllScreenshotFiles } from './sftpUpload.js';
 
 // How long a screenshot is kept before it's deleted (both the MongoDB
 // record AND the actual image file on cPanel) — requested as "one month"
@@ -65,5 +65,75 @@ export async function cleanupOldScreenshots() {
     ftpDeleted,
     ftpFailed,
     noRelativePath,
+  };
+}
+
+// services/screenshot.js names every capture "<pageSlug>-<Date.now()>.jpg"
+// (see captureSitePage) — the millisecond-epoch timestamp is right there in
+// the filename. This lets orphan cleanup below determine a file's true age
+// directly from its name, with no dependency on MongoDB (which is exactly
+// the thing that's missing for an orphan) and no dependency on the FTP
+// server's own modification-time reporting (unreliable across different
+// FTP servers/configs — see basic-ftp's own FileInfo docs: only servers
+// supporting the modern MLSD command return a reliably parseable date at
+// all, and cPanel's plain FTP often doesn't).
+const FILENAME_TIMESTAMP_RE = /-(\d{10,})\.[a-z0-9]+$/i;
+
+/**
+ * Deletes screenshot files sitting on cPanel that are older than
+ * SCREENSHOT_RETENTION_DAYS but have NO corresponding MongoDB Screenshot
+ * record at all — files cleanupOldScreenshots() above can never see, since
+ * it only ever looks at rows that still exist in Mongo. Confirmed live:
+ * this codebase's oldest screenshots for at least one site were sitting on
+ * cPanel 45+ days later while MongoDB had zero old Screenshot rows for it,
+ * meaning those DB rows were gone (whatever the original cause) while the
+ * files themselves never got cleaned up — cleanupOldScreenshots() reported
+ * "found: 0" for a genuinely full month of leftover images.
+ *
+ * Run this AFTER cleanupOldScreenshots() in the same pass (see
+ * screenshotCleanupJob in server.js and POST /api/screenshots/cleanup-now)
+ * — by the time this runs, every file that's old AND still DB-tracked has
+ * already been removed by that step, so whatever this finds is guaranteed
+ * to be a genuine orphan, not a race with the DB-driven pass.
+ *
+ * A file whose name doesn't match the expected "-<timestamp>.ext" pattern
+ * is left alone and counted separately (`unparseable`) rather than risking
+ * deleting something this wasn't meant to touch.
+ *
+ * @returns {Promise<{
+ *   totalFiles: number,
+ *   found: number,
+ *   deleted: number,
+ *   failed: { relativePath: string, error: string }[],
+ *   unparseable: number,
+ * }>}
+ */
+export async function cleanupOrphanedScreenshotFiles() {
+  const cutoffMs = Date.now() - SCREENSHOT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const allFiles = await listAllScreenshotFiles();
+
+  const oldPaths = [];
+  let unparseable = 0;
+  for (const f of allFiles) {
+    const m = FILENAME_TIMESTAMP_RE.exec(f.name);
+    if (!m) { unparseable++; continue; }
+    const capturedAtMs = Number(m[1]);
+    if (Number.isFinite(capturedAtMs) && capturedAtMs < cutoffMs) oldPaths.push(f.relativePath);
+  }
+
+  if (!oldPaths.length) {
+    return { totalFiles: allFiles.length, found: 0, deleted: 0, failed: [], unparseable };
+  }
+
+  const result = await deleteScreenshots(oldPaths);
+  if (result.failed.length) {
+    console.error(`[screenshotRetention] ${result.failed.length} orphan FTP delete(s) failed:`, JSON.stringify(result.failed.slice(0, 10)));
+  }
+  return {
+    totalFiles: allFiles.length,
+    found: oldPaths.length,
+    deleted: result.succeeded,
+    failed: result.failed,
+    unparseable,
   };
 }

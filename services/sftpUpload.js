@@ -173,3 +173,49 @@ export async function deleteScreenshots(relativePaths) {
   }
   return result;
 }
+
+/**
+ * Recursively lists EVERY file under the screenshots root on cPanel,
+ * regardless of what MongoDB thinks exists — used by
+ * services/screenshotRetention.js's orphan cleanup to catch screenshot
+ * files that no longer have (or maybe never had) a matching Screenshot
+ * document. Confirmed live: a site's oldest screenshots were still sitting
+ * on cPanel 45+ days later even though MongoDB had zero Screenshot records
+ * that old for it — the DB-driven cleanup (deleteScreenshots above, called
+ * from cleanupOldScreenshots) can only ever act on rows that still exist in
+ * Mongo, so a file whose row was already gone (however that happened) was
+ * invisible to it and would stay orphaned on cPanel forever.
+ *
+ * Walks the whole directory tree with a single connection (folders are
+ * typically one per site, e.g. "vizkart-pk/home-1785147091200.jpg").
+ *
+ * @returns {Promise<{ relativePath: string, name: string }[]>}
+ */
+export async function listAllScreenshotFiles() {
+  const { client, remoteBase } = await connect();
+  const files = [];
+  try {
+    await walkFtpDir(client, remoteBase, remoteBase, files);
+  } finally {
+    client.close();
+  }
+  return files;
+}
+
+async function walkFtpDir(client, dirAbsPath, remoteBase, files) {
+  let items;
+  try {
+    items = await client.list(dirAbsPath);
+  } catch (e) {
+    console.error(`[sftpUpload] failed to list directory ${dirAbsPath}:`, e.message);
+    return;
+  }
+  for (const item of items) {
+    const itemAbsPath = path.posix.join(dirAbsPath, item.name);
+    if (item.isDirectory) {
+      await walkFtpDir(client, itemAbsPath, remoteBase, files);
+    } else if (item.isFile) {
+      files.push({ relativePath: path.posix.relative(remoteBase, itemAbsPath), name: item.name });
+    }
+  }
+}

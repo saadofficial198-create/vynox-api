@@ -21,7 +21,7 @@ import { requireAuth } from './middleware/requireAuth.js';
 import Site from './models/Site.js';
 import JobLock from './models/JobLock.js';
 import { checkAllSitesPageSpeed } from './services/pagespeed.js';
-import { cleanupOldScreenshots, SCREENSHOT_RETENTION_DAYS } from './services/screenshotRetention.js';
+import { cleanupOldScreenshots, cleanupOrphanedScreenshotFiles, SCREENSHOT_RETENTION_DAYS } from './services/screenshotRetention.js';
 // NOTE: screenshot capture (Playwright/Chromium) does NOT run on this cPanel
 // backend anymore — shared cPanel Node.js hosting can't run a headless
 // browser (no system libs, no permission to install Chromium). Captures now
@@ -267,9 +267,21 @@ async function screenshotCleanupJob() {
 
   try {
     const result = await cleanupOldScreenshots();
-    console.log(`[screenshot-cleanup] run complete: found ${result.found} screenshot(s) older than ${SCREENSHOT_RETENTION_DAYS} days — DB: ${result.dbDeleted} deleted, FTP: ${result.ftpDeleted} deleted / ${result.ftpFailed.length} failed / ${result.noRelativePath} had no stored path`);
+    console.log(`[screenshot-cleanup] DB-tracked pass complete: found ${result.found} screenshot(s) older than ${SCREENSHOT_RETENTION_DAYS} days — DB: ${result.dbDeleted} deleted, FTP: ${result.ftpDeleted} deleted / ${result.ftpFailed.length} failed / ${result.noRelativePath} had no stored path`);
   } catch (e) {
-    console.error('[screenshot-cleanup] run failed:', e.message);
+    console.error('[screenshot-cleanup] DB-tracked pass failed:', e.message);
+  }
+
+  try {
+    // Runs AFTER the DB-tracked pass above — by now, anything old that was
+    // still DB-tracked is already gone, so anything this still finds is a
+    // genuine orphan (a file with no matching Screenshot document at all —
+    // confirmed to actually happen live, see cleanupOrphanedScreenshotFiles's
+    // own comment for the full story).
+    const orphanResult = await cleanupOrphanedScreenshotFiles();
+    console.log(`[screenshot-cleanup] orphan-file pass complete: scanned ${orphanResult.totalFiles} file(s) on cPanel, found ${orphanResult.found} older than ${SCREENSHOT_RETENTION_DAYS} days with no DB record — deleted ${orphanResult.deleted} / ${orphanResult.failed.length} failed (${orphanResult.unparseable} file(s) had an unrecognized name and were left alone)`);
+  } catch (e) {
+    console.error('[screenshot-cleanup] orphan-file pass failed:', e.message);
   } finally {
     await JobLock.findOneAndUpdate(
       { key: 'screenshot-cleanup' },

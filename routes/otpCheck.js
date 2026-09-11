@@ -11,8 +11,15 @@ const router = express.Router();
 
 // GET /api/otp-check/latest — most recent OtpCheck doc for EVERY site that
 // has at least one check recorded (sites never checked yet are omitted).
+//
+// Sites with the OTP monitor switched off are excluded too: they're the
+// ones that aren't shops at all, so listing their last-ever result in the
+// dashboard's OTP panel would be stale noise about a check that is no
+// longer running. Their historical OtpCheck rows are left in the database
+// untouched — turning the monitor back on restores the full history rather
+// than starting from nothing.
 router.get('/latest', async (_req, res) => {
-  const sites = await Site.find().lean();
+  const sites = await Site.find({ otpCheckEnabled: { $ne: false } }).lean();
   if (!sites.length) return res.json({ ok: true, checks: [] });
 
   const checks = await Promise.all(

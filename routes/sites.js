@@ -245,8 +245,12 @@ router.get('/:id', async (req, res) => {
 // shape is kept as-is rather than narrowed to a plain string so this
 // doesn't require a data migration if multi-badge support is ever added
 // later. An empty/omitted badge clears it (site.tags = []).
+//
+// Also carries otpCheckEnabled — the "is this site a shop?" switch. Not
+// every monitored site has a checkout, and the OTP monitor is meaningless
+// on one that doesn't (see models/Site.js and scripts/runOtpCheck.js).
 router.put('/:id', async (req, res) => {
-  const { name, badge } = req.body || {};
+  const { name, badge, otpCheckEnabled } = req.body || {};
   const update = {};
   if (typeof name === 'string') {
     const trimmed = name.trim();
@@ -255,6 +259,9 @@ router.put('/:id', async (req, res) => {
   }
   if (badge !== undefined) {
     update.tags = badge ? [String(badge)] : [];
+  }
+  if (typeof otpCheckEnabled === 'boolean') {
+    update.otpCheckEnabled = otpCheckEnabled;
   }
   if (!Object.keys(update).length) {
     return res.status(400).json({ ok: false, error: 'Nothing to update' });

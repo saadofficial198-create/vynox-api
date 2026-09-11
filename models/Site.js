@@ -80,6 +80,21 @@ const SiteSchema = new mongoose.Schema(
     // selection in Settings) is the ONLY thing that sets this to true.
     pagesConfigured: { type: Boolean, default: false },
 
+    // Whether the twice-daily OTP email-delivery monitor should run against
+    // this site at all (see scripts/runOtpCheck.js). Not every monitored
+    // site is a shop — a brochure/blog site has no checkout and no OTP
+    // plugin, so running the check there is pointless: it just records
+    // "not_applicable" forever and adds noise to the dashboard's OTP panel.
+    //
+    // Deliberately an explicit opt-OUT rather than being inferred from
+    // "does this site have WooCommerce": inference gets it wrong in both
+    // directions (a WooCommerce site can exist without OTP-at-checkout, and
+    // a site can have the plugin installed but not use it), and the user is
+    // the one who actually knows. Default true so existing behaviour is
+    // unchanged and a genuine shop is never silently skipped — the user
+    // turns it off for the sites where it doesn't apply.
+    otpCheckEnabled: { type: Boolean, default: true },
+
     // Tracks whether THIS site's hosting server has allowlisted our
     // X-Vynox-Bot header in its Imunify360 (or similar) bot-protection
     // firewall — see services/otpCheck.js and the Imunify360 allowlist

@@ -166,14 +166,23 @@ async function main() {
   await mongoose.connect(MONGO_URI);
   console.log('[runOtpCheck] connected.');
 
-  const sites = await Site.find().lean();
+  // Skip sites the user has turned the OTP monitor off for — not every
+  // monitored site is a shop, and there's no checkout (and no OTP plugin)
+  // on a brochure or blog site. Filtered in the query rather than inside
+  // checkOneSite so a disabled site produces no OtpCheck record at all,
+  // keeping it out of the dashboard's OTP panel entirely instead of
+  // showing it as a permanent "N/A" row. $ne:false rather than
+  // otpCheckEnabled:true so sites saved before this field existed (where
+  // it's absent, not false) still get checked — the schema default only
+  // applies to documents written after it was added.
+  const sites = await Site.find({ otpCheckEnabled: { $ne: false } }).lean();
   if (!sites.length) {
-    console.log('[runOtpCheck] no sites registered yet — nothing to check.');
+    console.log('[runOtpCheck] no sites with the OTP monitor enabled — nothing to check.');
     await mongoose.disconnect();
     process.exit(0);
     return;
   }
-  console.log(`[runOtpCheck] checking ${sites.length} site(s)...`);
+  console.log(`[runOtpCheck] checking ${sites.length} site(s) with the OTP monitor enabled...`);
 
   let anyFailed = false;
   for (const site of sites) {

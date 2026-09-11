@@ -2,7 +2,7 @@ import express from 'express';
 import Site from '../models/Site.js';
 import Screenshot from '../models/Screenshot.js';
 import { triggerGithubWorkflow } from '../services/githubTrigger.js';
-import { cleanupOldScreenshots, cleanupOrphanedScreenshotFiles, SCREENSHOT_RETENTION_DAYS } from '../services/screenshotRetention.js';
+import { cleanupOldScreenshots, cleanupOrphanedScreenshotFiles, detectOrphanScreenshots, SCREENSHOT_RETENTION_DAYS } from '../services/screenshotRetention.js';
 import { mergeScreenshotFolders } from '../services/screenshotMigration.js';
 
 const router = express.Router();
@@ -17,6 +17,20 @@ const router = express.Router();
 router.post('/merge-folders-now', async (_req, res) => {
   try {
     const result = await mergeScreenshotFolders();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/screenshots/orphans-detect — DIAGNOSTIC: scan cPanel for ALL
+// orphan files (files with NO MongoDB Screenshot record) WITHOUT deleting
+// anything. Returns total counts + detailed list of orphaned files with
+// sizes and timestamps, so the user can decide whether to delete them.
+// Useful before running the destructive cleanup function.
+router.get('/orphans-detect', async (_req, res) => {
+  try {
+    const result = await detectOrphanScreenshots();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });

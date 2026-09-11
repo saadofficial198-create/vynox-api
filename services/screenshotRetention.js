@@ -137,3 +137,57 @@ export async function cleanupOrphanedScreenshotFiles() {
     unparseable,
   };
 }
+
+/**
+ * DIAGNOSTIC: List ALL orphan files (files on cPanel with NO matching
+ * MongoDB record) WITHOUT deleting anything. Useful before running a
+ * destructive cleanup to confirm exactly what will be removed.
+ *
+ * Returns: list of files with their sizes and timestamps, grouped by
+ * whether they're registered in MongoDB or not.
+ *
+ * @returns {Promise<{
+ *   totalFiles: number,
+ *   registeredInDb: number,
+ *   orphaned: { relativePath: string, name: string, size: number, timestampMs: number, capturedDate: string }[],
+ *   unparseable: number,
+ * }>}
+ */
+export async function detectOrphanScreenshots() {
+  const allFiles = await listAllScreenshotFiles();
+  const allDbPaths = new Set();
+
+  const dbRecords = await Screenshot.find().select('relativePath').lean();
+  for (const rec of dbRecords) {
+    if (rec.relativePath) allDbPaths.add(rec.relativePath);
+  }
+
+  const orphaned = [];
+  let unparseable = 0;
+
+  for (const f of allFiles) {
+    const m = FILENAME_TIMESTAMP_RE.exec(f.name);
+    if (!m) { unparseable++; continue; }
+
+    const timestampMs = Number(m[1]);
+    if (!Number.isFinite(timestampMs)) { unparseable++; continue; }
+
+    const isOrphan = !allDbPaths.has(f.relativePath);
+    if (isOrphan) {
+      orphaned.push({
+        relativePath: f.relativePath,
+        name: f.name,
+        size: f.size,
+        timestampMs,
+        capturedDate: new Date(timestampMs).toISOString(),
+      });
+    }
+  }
+
+  return {
+    totalFiles: allFiles.length,
+    registeredInDb: allDbPaths.size,
+    orphaned: orphaned.sort((a, b) => b.timestampMs - a.timestampMs),
+    unparseable,
+  };
+}

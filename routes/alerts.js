@@ -2,6 +2,7 @@ import express from 'express';
 import Site from '../models/Site.js';
 import Snapshot from '../models/Snapshot.js';
 import Alert from '../models/Alert.js';
+import { findRiskyPlugins } from '../services/riskyPlugins.js';
 
 const router = express.Router();
 
@@ -121,6 +122,20 @@ function deriveAlerts(site, snap) {
       }
     });
   }
+
+  // Plugins that are a security risk by their very nature, regardless of
+  // version — chiefly file managers, which expose read/write/execute over
+  // the whole server through the browser. See services/riskyPlugins.js for
+  // why this is a short curated list rather than a CVE feed.
+  findRiskyPlugins(d).forEach((rp) => {
+    push(
+      `risky-plugin-${rp.slug}`,
+      `${rp.label}: ${rp.name}`,
+      `"${rp.name}"${rp.version ? ` v${rp.version}` : ''} is installed and ${rp.status === 'active' ? 'ACTIVE' : 'inactive (files still on disk and reachable by direct URL — deactivating does not remove the risk)'}. ${rp.why}`,
+      'Vulnerability',
+      rp.severity
+    );
+  });
 
   // Imunify360 allowlist tracking — auto-set to 'blocked' by
   // scripts/runOtpCheck.js when an OTP check's send_otp AJAX call is
